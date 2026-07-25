@@ -34,6 +34,8 @@ export const authOptions: NextAuthOptions = {
         return {
           id: user._id.toString(),
           email: user.email,
+          name: user.fullName || "User",
+          username: user.username || "user",
         };
       },
     }),
@@ -64,6 +66,8 @@ export const authOptions: NextAuthOptions = {
       if (user) {
         token.sub = user.id; // sub is automatically mapped to id in FastAPI
         token.email = user.email;
+        token.name = user.name;
+        token.username = (user as any).username;
       }
       return token;
     },
@@ -72,6 +76,8 @@ export const authOptions: NextAuthOptions = {
         // Expose token to client so it can pass it to FastAPI
         (session as any).accessToken = jwt.sign(token, process.env.NEXTAUTH_SECRET as string, { algorithm: "HS256" });
         session.user.id = token.sub;
+        session.user.name = token.name;
+        (session.user as any).username = token.username;
       }
       return session;
     },

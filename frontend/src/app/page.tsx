@@ -39,84 +39,87 @@ export default function ChatPage() {
       localStorage.setItem("guest_session_id", storedSession);
     }
     setGuestSessionId(storedSession);
-    
-    // Load guest message count
-    const count = parseInt(localStorage.getItem("guest_message_count") || "0", 10);
+
+    // Load guest count
+    const count = parseInt(localStorage.getItem(`guest_count_${storedSession}`) || "0");
     setGuestMessageCount(count);
   }, []);
-
-  // Fetch user history once authenticated or if guest
-  useEffect(() => {
-    if (status === "authenticated" && (session as any)?.accessToken) {
-      fetchHistory();
-    } else if (status === "unauthenticated" && guestSessionId) {
-      fetchHistory();
-    }
-  }, [status, session, guestSessionId]);
-
-  // Scroll to bottom
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
 
   const getHeaders = () => {
     const headers: Record<string, string> = {};
     if (status === "authenticated" && (session as any)?.accessToken) {
       headers["Authorization"] = `Bearer ${(session as any).accessToken}`;
-    } else if (guestSessionId) {
+    } else {
       headers["X-Session-ID"] = guestSessionId;
     }
     return headers;
   };
 
-  const fetchHistory = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/history`, { headers: getHeaders() });
-      if (res.ok) {
-        const data = await res.json();
-        setMessages(data);
-      }
-    } catch (error) {
-      console.error("Failed to fetch history", error);
-    }
-  };
-
-  const sendMessage = async (e?: React.FormEvent, textOverride?: string) => {
-    if (e) e.preventDefault();
-    
-    if (status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT) {
-      alert("You have reached your free guest limit. Please log in to continue.");
-      router.push("/login");
-      return;
-    }
-
-    const textToSend = textOverride || inputText;
-    if (!textToSend.trim() || isLoading) return;
-
+  const updateGuestCount = () => {
     if (status === "unauthenticated") {
       const newCount = guestMessageCount + 1;
       setGuestMessageCount(newCount);
-      localStorage.setItem("guest_message_count", newCount.toString());
+      localStorage.setItem(`guest_count_${guestSessionId}`, newCount.toString());
+      return newCount;
+    }
+    return guestMessageCount;
+  };
+
+  const fetchHistory = async () => {
+    if (status === "loading" || (!guestSessionId && status === "unauthenticated")) return;
+    
+    try {
+      const res = await fetch(`${API_BASE}/history`, {
+        headers: getHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(data.messages || []);
+        setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+      }
+    } catch (error) {
+      console.error("Failed to load history", error);
+    }
+  };
+
+  useEffect(() => {
+    fetchHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, guestSessionId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const sendMessage = async (e?: React.FormEvent, textOverride?: string) => {
+    e?.preventDefault();
+    const textToSend = textOverride || inputText;
+    if (!textToSend.trim() || isLoading) return;
+
+    if (status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT) {
+      alert("You have reached your free guest limit. Please log in or sign up to continue.");
+      router.push("/signup");
+      return;
     }
 
-    const userMessage: Message = { role: "user", content: textToSend };
-    setMessages((prev) => [...prev, userMessage]);
+    const newUserMsg: Message = { role: "user", content: textToSend };
+    setMessages((prev) => [...prev, newUserMsg]);
     setInputText("");
     setIsLoading(true);
+
+    updateGuestCount();
 
     try {
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
           ...getHeaders(),
         },
         body: JSON.stringify({ message: textToSend }),
       });
-
+      
       if (!res.ok) {
-        if (res.status === 429) throw new Error("Rate limit exceeded. Please wait a moment.");
-        if (res.status === 401 && status === "authenticated") signOut();
         throw new Error("Failed to send message");
       }
       
@@ -150,6 +153,7 @@ export default function ChatPage() {
         body: formData,
       });
       if (res.ok) {
+        updateGuestCount();
         setMessages((prev) => [...prev, { role: "assistant", content: `Successfully ingested document: ${file.name}` }]);
       } else {
         const err = await res.json();
@@ -169,76 +173,103 @@ export default function ChatPage() {
 
   if (status === "loading") {
     return (
-      <div className="flex h-screen w-full items-center justify-center bg-white">
-        <div className="animate-pulse text-zinc-400">Loading...</div>
+      <div className="flex h-screen w-full items-center justify-center bg-[#0f0f11]">
+        <div className="animate-pulse text-zinc-600">Loading...</div>
       </div>
     );
   }
 
   const isGuestLimitReached = status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT;
+  
+  const displayName = session?.user?.name 
+    ? session.user.name.split(" ")[0] 
+    : (status === "unauthenticated" ? "Guest" : "Tharun");
 
   return (
-    <div className="flex w-full h-screen bg-white text-zinc-900 overflow-hidden relative font-sans">
+    <div className="flex h-screen w-full bg-[#0f0f11] text-zinc-100 overflow-hidden font-sans relative">
       
       {/* Mobile Sidebar Overlay */}
       {sidebarOpen && (
         <div 
-          className="fixed inset-0 bg-black/20 z-20 md:hidden"
+          className="fixed inset-0 bg-black/60 z-20 md:hidden backdrop-blur-sm"
           onClick={() => setSidebarOpen(false)}
         />
       )}
 
-      {/* Sidebar */}
-      <aside className={`absolute md:static w-64 h-full bg-[#f9f9f9] border-r border-zinc-200 flex flex-col z-30 transition-transform transform ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0`}>
-        <div className="p-4 flex items-center justify-between">
-          <span className="font-semibold text-xs tracking-wide text-zinc-500 uppercase mt-1">History</span>
-          <button className="md:hidden p-1 text-zinc-500" onClick={() => setSidebarOpen(false)}>
-            <X className="w-5 h-5" />
+      {/* Minimal Sidebar */}
+      <aside className={`absolute md:static transition-all duration-300 ease-in-out border-r border-zinc-900 bg-zinc-950 flex flex-col items-center py-6 h-full z-30 ${sidebarOpen ? "translate-x-0 w-64 px-4" : "-translate-x-full md:translate-x-0 w-16"}`}>
+        
+        {/* Top Actions */}
+        <div className="flex flex-col gap-4 w-full items-center">
+          <button 
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            className="hidden md:flex p-2 rounded-xl text-zinc-400 hover:text-white hover:bg-zinc-900 transition-colors self-center"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+          
+          <button className="md:hidden p-2 rounded-xl text-zinc-400 self-end" onClick={() => setSidebarOpen(false)}>
+             <X className="w-5 h-5" />
+          </button>
+          
+          <button 
+            onClick={() => { setMessages([]); setSidebarOpen(false); }}
+            className={`flex items-center gap-3 p-2 rounded-xl text-zinc-300 hover:text-white hover:bg-zinc-900 transition-colors w-full ${sidebarOpen ? "justify-start px-3" : "justify-center"}`}
+          >
+            <Send className="w-5 h-5" />
+            {sidebarOpen && <span className="text-sm font-medium">New chat</span>}
           </button>
         </div>
-        
-        <div className="flex-1 overflow-y-auto px-4 py-2">
-          {messages.length === 0 ? (
-            <div className="text-[13px] text-zinc-400 leading-relaxed mt-2">
-              Your conversations will appear here once you start chatting!
-            </div>
-          ) : (
-            <div className="text-[14px] text-zinc-700 truncate hover:bg-zinc-100 p-2 rounded-lg cursor-pointer">
-              {messages.filter(m => m.role === 'user')[0]?.content || "Current Session"}
-            </div>
+
+        {/* History Area */}
+        <div className="flex-1 w-full overflow-y-auto mt-8 flex flex-col gap-2 no-scrollbar">
+          {sidebarOpen && (
+            <div className="text-xs font-semibold text-zinc-600 uppercase tracking-wider mb-2 px-2">History</div>
           )}
+          {sidebarOpen && [1, 2, 3].map((i) => (
+            <button key={i} className="text-left w-full p-2 text-sm text-zinc-400 hover:text-white hover:bg-zinc-900 rounded-lg truncate transition-colors">
+              Chat session {i}
+            </button>
+          ))}
         </div>
 
-        {/* User Profile Dropdown Area */}
-        <div className="p-3 relative">
+        {/* User Profile */}
+        <div className="mt-auto w-full relative">
           <button 
             onClick={() => setUserMenuOpen(!userMenuOpen)}
-            className="flex items-center w-full p-2 hover:bg-zinc-200/50 rounded-xl transition-colors text-left"
+            className={`flex items-center gap-3 p-2 rounded-xl hover:bg-zinc-900 transition-colors w-full ${sidebarOpen ? "justify-between px-3" : "justify-center"}`}
           >
-            <div className="w-8 h-8 rounded-full bg-[#5d3f3f] text-white flex items-center justify-center flex-shrink-0 text-sm font-medium">
-              {status === "authenticated" ? session?.user?.email?.[0].toUpperCase() : "G"}
+            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white text-sm font-medium shrink-0">
+              {session?.user?.name ? session.user.name.charAt(0).toUpperCase() : "G"}
             </div>
-            <div className="ml-3 flex-1 overflow-hidden">
-              <div className="text-sm font-medium truncate text-zinc-800">
-                {status === "authenticated" ? session?.user?.email : "Guest"}
+            {sidebarOpen && (
+              <div className="flex-1 text-left truncate">
+                <p className="text-sm font-medium truncate">{session?.user?.name || "Guest"}</p>
               </div>
-            </div>
-            {userMenuOpen ? <ChevronDown className="w-4 h-4 text-zinc-400" /> : <ChevronUp className="w-4 h-4 text-zinc-400" />}
+            )}
+            {sidebarOpen && <ChevronUp className="w-4 h-4 text-zinc-500 shrink-0" />}
           </button>
 
+          {/* User Menu Dropdown */}
           {userMenuOpen && (
-            <div className="absolute bottom-16 left-3 right-3 bg-white border border-zinc-200 rounded-xl shadow-lg py-1 z-40 animate-in fade-in zoom-in-95 duration-100">
+            <div className={`absolute bottom-full left-0 mb-2 bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl py-1 z-50 ${sidebarOpen ? "w-full" : "w-48 ml-2"}`}>
               {status === "authenticated" ? (
-                <button 
-                  onClick={() => signOut()} 
-                  className="w-full text-left px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50 flex items-center gap-2"
-                >
-                  <LogOut className="w-4 h-4" /> Log out
-                </button>
+                <>
+                  <div className="px-3 py-2 border-b border-zinc-800 mb-1">
+                    <p className="text-sm font-medium text-white truncate">{session.user.name}</p>
+                    <p className="text-xs text-zinc-400 truncate">{(session.user as any).username ? `@${(session.user as any).username}` : session.user.email}</p>
+                  </div>
+                  <button 
+                    onClick={() => signOut()}
+                    className="w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-zinc-800 flex items-center gap-2"
+                  >
+                    <LogOut className="w-4 h-4" /> Log out
+                  </button>
+                </>
               ) : (
                 <>
-                  <Link href="/login" className="block px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50">Log In</Link>
-                  <Link href="/signup" className="block px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50">Sign Up</Link>
+                  <Link href="/login" className="block px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-white">Log in</Link>
+                  <Link href="/signup" className="block px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-white">Sign up</Link>
                 </>
               )}
             </div>
@@ -246,94 +277,62 @@ export default function ChatPage() {
         </div>
       </aside>
 
-      {/* Main Chat Area */}
-      <main className="flex-1 flex flex-col h-full relative min-w-0 bg-white">
+      {/* Main Content Area */}
+      <main className="flex-1 flex flex-col relative h-full min-w-0">
         
-        {/* Mobile header (hamburger) */}
-        <header className="md:hidden p-4 flex items-center border-b border-zinc-100">
-          <button onClick={() => setSidebarOpen(true)} className="p-2 -ml-2 text-zinc-600">
+        {/* Mobile Header */}
+        <header className="md:hidden flex items-center p-4 border-b border-zinc-900 z-10 shrink-0 bg-[#0f0f11]/80 backdrop-blur-md">
+          <button onClick={() => setSidebarOpen(true)} className="p-2 -ml-2 text-zinc-400">
             <Menu className="w-5 h-5" />
           </button>
-          <div className="font-medium ml-2">Ragasiyam</div>
+          <span className="font-semibold text-white ml-2 tracking-wide text-sm">Ragasiyam</span>
         </header>
 
-        <div className="flex-1 overflow-y-auto w-full">
+        {/* Subtle radial glow in the center */}
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-blue-900/10 rounded-full blur-[120px] pointer-events-none" />
+
+        {/* Chat Area */}
+        <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-40 no-scrollbar relative z-10 flex flex-col">
           {messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full max-w-2xl mx-auto px-4 pb-32 pt-10">
-              <div className="w-16 h-16 bg-zinc-100 text-zinc-800 rounded-2xl flex items-center justify-center mb-6">
-                <Bot className="w-8 h-8" />
-              </div>
-              <h1 className="text-3xl font-semibold text-zinc-800 mb-2 text-center">What can I help with?</h1>
-              <p className="text-zinc-500 text-center mb-10 max-w-md leading-relaxed">
-                Upload your documents and ask anything. I will securely answer strictly based on your files.
-              </p>
-              
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
-                {[
-                  "Summarize the key points in my document.",
-                  "What are the action items?",
-                  "Extract any names and dates.",
-                  "Explain the main concept simply."
-                ].map((suggestion, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => handleSuggestionClick(suggestion)}
-                    className="p-4 bg-white border border-zinc-200 rounded-xl text-left text-sm text-zinc-600 hover:border-zinc-300 hover:bg-zinc-50 transition-all shadow-sm"
-                  >
-                    {suggestion}
-                  </button>
-                ))}
-              </div>
+            <div className="h-full flex flex-col items-center justify-center -mt-20">
+              <h1 className="text-4xl md:text-[44px] font-medium tracking-tight mb-12 text-center text-white drop-shadow-sm">
+                What's the vibe, {displayName}?
+              </h1>
             </div>
           ) : (
-            <div className="flex flex-col w-full max-w-3xl mx-auto pb-48 pt-8 px-4">
-              {messages.map((msg, i) => (
-                <div 
-                  key={i} 
-                  className={`flex w-full mb-6 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-                >
-                  <div className={`flex gap-4 max-w-[90%] md:max-w-[80%] ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
-                    <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 mt-1 ${
-                      msg.role === "user" 
-                        ? "bg-zinc-200 text-zinc-600" 
-                        : "bg-zinc-800 text-white shadow-sm"
-                    }`}>
-                      {msg.role === "user" ? <User className="w-5 h-5" /> : <Bot className="w-5 h-5" />}
-                    </div>
-                    
-                    <div className={`px-5 py-3.5 rounded-2xl leading-relaxed text-[15px] ${
-                      msg.role === "user" 
-                        ? "bg-zinc-100 text-zinc-800 rounded-tr-sm" 
-                        : "bg-white text-zinc-800 border border-zinc-200 shadow-sm rounded-tl-sm whitespace-pre-wrap"
-                    }`}>
-                      {msg.content}
-                    </div>
+            <div className="max-w-3xl mx-auto w-full flex flex-col gap-6 pt-8">
+              {messages.map((m, idx) => (
+                <div key={idx} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div className={`max-w-[85%] rounded-3xl px-5 py-3.5 ${
+                    m.role === "user" 
+                      ? "bg-zinc-800 text-zinc-100" 
+                      : "bg-transparent text-zinc-300"
+                  }`}>
+                    {m.role === "assistant" && (
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="w-6 h-6 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center shrink-0">
+                          <Bot className="w-3.5 h-3.5 text-white" />
+                        </div>
+                        <span className="text-xs font-medium text-zinc-500">Ragasiyam Core</span>
+                      </div>
+                    )}
+                    <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
                   </div>
                 </div>
               ))}
-              
               {isLoading && (
-                <div className="flex w-full mb-6 justify-start">
-                  <div className="flex gap-4 flex-row">
-                    <div className="w-8 h-8 rounded-full bg-zinc-800 text-white flex items-center justify-center flex-shrink-0 mt-1 shadow-sm">
-                      <Bot className="w-5 h-5" />
-                    </div>
-                    <div className="px-5 py-4 rounded-2xl bg-white border border-zinc-200 shadow-sm rounded-tl-sm flex items-center gap-2">
-                      <span className="w-2 h-2 bg-zinc-800 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
-                      <span className="w-2 h-2 bg-zinc-800 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
-                      <span className="w-2 h-2 bg-zinc-800 rounded-full animate-bounce"></span>
-                    </div>
+                <div className="flex justify-start">
+                  <div className="bg-transparent text-zinc-500 px-5 py-3.5 flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-zinc-600 animate-bounce" />
+                    <div className="w-2 h-2 rounded-full bg-zinc-600 animate-bounce [animation-delay:0.2s]" />
+                    <div className="w-2 h-2 rounded-full bg-zinc-600 animate-bounce [animation-delay:0.4s]" />
                   </div>
                 </div>
               )}
-              
               {isUploading && (
-                <div className="flex w-full mb-6 justify-start">
-                  <div className="px-5 py-3 rounded-xl bg-zinc-50 text-zinc-700 text-sm border border-zinc-200 flex items-center ml-12">
-                    <span className="animate-pulse flex items-center">
-                      <Paperclip className="w-4 h-4 mr-2" />
-                      Ingesting document...
-                    </span>
+                <div className="flex justify-start">
+                  <div className="bg-transparent text-zinc-500 px-5 py-3.5 flex items-center gap-2 text-sm">
+                    <Paperclip className="w-4 h-4 animate-pulse" /> Ingesting document...
                   </div>
                 </div>
               )}
@@ -342,23 +341,37 @@ export default function ChatPage() {
           )}
         </div>
 
-        {/* Updated Input Area */}
-        <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-white via-white to-transparent pt-12 pb-6 px-4">
-          <div className="max-w-3xl mx-auto relative">
-            
-            {isGuestLimitReached && (
-              <div className="absolute -top-14 left-0 right-0 flex justify-center">
-                <div className="bg-amber-50 text-amber-800 px-4 py-2 rounded-full text-[13px] shadow-sm flex items-center gap-2 border border-amber-200">
-                  Guest limit reached. <Link href="/login" className="underline font-medium hover:text-amber-900">Log in to continue</Link>
-                </div>
-              </div>
-            )}
+        {/* Input Area */}
+        <div className="absolute bottom-0 left-0 right-0 p-4 md:px-8 pb-8 bg-gradient-to-t from-[#0f0f11] via-[#0f0f11] to-transparent z-20">
+          
+          {isGuestLimitReached && (
+            <div className="max-w-3xl mx-auto mb-4 p-3 bg-indigo-950/50 border border-indigo-900/50 rounded-xl text-indigo-200 text-sm text-center backdrop-blur-md">
+              You've reached your free guest limit. <Link href="/signup" className="font-semibold underline hover:text-white">Sign up</Link> to continue chatting and uploading documents.
+            </div>
+          )}
 
-            <form 
-              onSubmit={sendMessage}
-              className={`bg-[#f4f4f4] border border-transparent rounded-2xl p-3 flex flex-col transition-all focus-within:bg-white focus-within:border-zinc-300 focus-within:shadow-md ${isGuestLimitReached ? 'opacity-50 pointer-events-none' : ''}`}
-            >
-              <textarea
+          <div className="max-w-3xl mx-auto relative">
+            <div className={`bg-zinc-900/80 backdrop-blur-xl border border-zinc-800/80 rounded-full flex items-center px-2 py-2 shadow-2xl transition-all focus-within:border-zinc-700 focus-within:bg-zinc-900 focus-within:ring-1 focus-within:ring-zinc-700 ${isGuestLimitReached ? 'opacity-50 pointer-events-none' : ''}`}>
+              
+              <button 
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isUploading || isGuestLimitReached}
+                className="p-3 text-blue-500 hover:bg-zinc-800 rounded-full transition-colors shrink-0 disabled:opacity-50 flex items-center justify-center ml-1"
+                title="Attach a file"
+              >
+                {isUploading ? <div className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" /> : <Paperclip className="w-5 h-5" />}
+              </button>
+              
+              <input 
+                type="file" 
+                ref={fileInputRef}
+                onChange={handleFileUpload} 
+                className="hidden" 
+                accept=".txt,.pdf"
+              />
+
+              <input
+                type="text"
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 onKeyDown={(e) => {
@@ -367,58 +380,31 @@ export default function ChatPage() {
                     sendMessage();
                   }
                 }}
-                placeholder="Ask anything..."
-                disabled={isLoading || isUploading || isGuestLimitReached}
-                className="w-full bg-transparent resize-none border-none focus:outline-none text-[15px] placeholder-zinc-500 disabled:opacity-50 min-h-[50px] max-h-[200px] overflow-y-auto px-1"
-                rows={2}
+                disabled={isLoading || isGuestLimitReached}
+                placeholder="Ask Gemini"
+                className="flex-1 bg-transparent border-none text-white px-3 py-3 focus:outline-none focus:ring-0 placeholder:text-zinc-500 text-[15px] min-w-0"
               />
-              
-              <div className="flex items-center justify-between mt-2">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={handleFileUpload}
-                    className="hidden"
-                    accept=".pdf,.txt,text/plain,application/pdf"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={isUploading || isLoading || isGuestLimitReached}
-                    className="p-1.5 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-200/50 rounded-lg transition-colors disabled:opacity-50 flex items-center justify-center border border-zinc-200 bg-white"
-                    title="Attach document (PDF/TXT)"
-                  >
-                    <Paperclip className="w-4 h-4" />
-                  </button>
-                  
-                  {/* Model Indicator */}
-                  <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white border border-zinc-200 rounded-lg text-xs font-medium text-zinc-600 shadow-sm cursor-default">
-                    <Bot className="w-3.5 h-3.5 text-zinc-700" />
-                    Ragasiyam Core
-                  </div>
-                </div>
 
+              <div className="flex items-center pr-2 shrink-0 gap-2">
+                {/* Model Indicator Pill */}
+                <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full hover:bg-zinc-800 transition-colors cursor-pointer text-xs font-medium text-zinc-300 select-none border border-transparent hover:border-zinc-700">
+                  <div className="w-2 h-2 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]" />
+                  Pro
+                  <ChevronDown className="w-3.5 h-3.5 text-zinc-500" />
+                </div>
+                
                 <button
-                  type="submit"
-                  disabled={!inputText.trim() || isLoading || isUploading || isGuestLimitReached}
-                  className={`p-2 rounded-xl flex items-center justify-center transition-all ${
-                    inputText.trim() && !isLoading && !isUploading && !isGuestLimitReached
-                      ? "bg-zinc-800 text-white hover:bg-zinc-900 shadow-sm"
-                      : "bg-zinc-200 text-zinc-400"
-                  }`}
+                  onClick={() => sendMessage()}
+                  disabled={!inputText.trim() || isLoading || isGuestLimitReached}
+                  className="p-3 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-full transition-colors disabled:opacity-30 flex items-center justify-center mr-1"
                 >
-                  <Send className="w-4 h-4" />
+                  <Send className="w-5 h-5" />
                 </button>
               </div>
-            </form>
-            
-            <div className="text-center mt-3 text-xs text-zinc-400">
-              Ragasiyam can make mistakes. Consider verifying critical information.
             </div>
           </div>
         </div>
-        
+
       </main>
     </div>
   );

@@ -4,11 +4,11 @@ import clientPromise from "@/lib/mongodb";
 
 export async function POST(req: Request) {
   try {
-    const { email, password } = await req.json();
+    const { email, password, username, fullName } = await req.json();
 
-    if (!email || !password) {
+    if (!email || !password || !username || !fullName) {
       return NextResponse.json(
-        { message: "Email and password are required" },
+        { message: "Email, password, username, and full name are required" },
         { status: 400 }
       );
     }
@@ -33,6 +33,8 @@ export async function POST(req: Request) {
     const result = await usersCollection.insertOne({
       email,
       password: hashedPassword,
+      username,
+      fullName,
       createdAt: new Date(),
     });
 
