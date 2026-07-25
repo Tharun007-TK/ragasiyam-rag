@@ -12,15 +12,41 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Ambient ring animation */
+@keyframes ambientPulse {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50%       { opacity: 0.65; transform: scale(1.015); }
+}
+.ambient-ring {
+  animation: ambientPulse 3.5s ease-in-out infinite;
+}
+
+/* Rotating conic gradient for active ring */
+@keyframes rotateConic {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.ambient-ring-spin {
+  animation: rotateConic 6s linear infinite;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar        { width: 5px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: #d4d0cb; border-radius: 9999px; }
+.dark-scroll::-webkit-scrollbar-thumb { background: #3a3a3e; }
+
+/* Settings modal backdrop */
+.settings-backdrop {
+  backdrop-filter: blur(8px);
+}
+
+/* No-scrollbar utility */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
