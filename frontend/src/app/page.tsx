@@ -28,7 +28,7 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const API_BASE = "http://localhost:8000";
+  const API_BASE = "/api/py";
   const GUEST_LIMIT = 3;
 
   useEffect(() => {
@@ -153,8 +153,36 @@ export default function ChatPage() {
         body: formData,
       });
       if (res.ok) {
-        updateGuestCount();
-        setMessages((prev) => [...prev, { role: "assistant", content: `Successfully ingested document: ${file.name}` }]);
+        const data = await res.json();
+        const docId = data.doc_id;
+        
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        
+        // Poll for status
+        const pollStatus = setInterval(async () => {
+          try {
+            const statusRes = await fetch(`${API_BASE}/upload/status/${docId}`, { headers: getHeaders() });
+            if (statusRes.ok) {
+              const statusData = await statusRes.json();
+              if (statusData.status === "ready") {
+                clearInterval(pollStatus);
+                setIsUploading(false);
+                updateGuestCount();
+                setMessages((prev) => [...prev, { role: "assistant", content: `Successfully ingested document: ${file.name}` }]);
+              } else if (statusData.status === "failed") {
+                clearInterval(pollStatus);
+                setIsUploading(false);
+                alert("Failed to process document");
+              }
+            }
+          } catch (e) {
+            console.error(e);
+            clearInterval(pollStatus);
+            setIsUploading(false);
+          }
+        }, 2000);
+        
+        return; // Don't set isUploading=false yet
       } else {
         const err = await res.json();
         throw new Error(err.detail || "Upload failed");
@@ -162,9 +190,9 @@ export default function ChatPage() {
     } catch (error: any) {
       console.error(error);
       alert(error.message || "Failed to upload document");
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
-    setIsUploading(false);
-    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const handleSuggestionClick = (text: string) => {

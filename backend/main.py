@@ -15,7 +15,7 @@ import threading
 import json
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -65,6 +65,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-2")   # 768-dim,
 mongo_client = AsyncIOMotorClient(MONGODB_URI)
 db           = mongo_client["ragasiyam"]
 chats_col    = db["chats"]
+uploads_col  = db["uploads"]
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
 COLLECTION_NAME      = "ragasiyam_documents"
@@ -83,7 +84,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -167,8 +168,19 @@ def _embed_sync(text: str, task_type: str) -> list[float]:
     )
     return result["embedding"]
 
+def _embed_batch_sync(texts: list[str], task_type: str) -> list[list[float]]:
+    result = genai.embed_content(
+        model=EMBED_MODEL,
+        content=texts,
+        task_type=task_type,
+    )
+    return result["embedding"]
+
 async def embed(text: str, task_type: str = "retrieval_document") -> list[float]:
     return await asyncio.to_thread(_embed_sync, text, task_type)
+
+async def embed_batch(texts: list[str], task_type: str = "retrieval_document") -> list[list[float]]:
+    return await asyncio.to_thread(_embed_batch_sync, texts, task_type)
 
 
 # ── MongoDB helpers ───────────────────────────────────────────────────────────
@@ -195,9 +207,67 @@ async def save_message(user_id: str, role: str, content: str):
 
 
 # ── POST /upload ──────────────────────────────────────────────────────────────
+async def process_upload_task(doc_id: str, filename: str, user_id: str, content: bytes):
+    try:
+        # Load with LangChain
+        if filename.lower().endswith(".pdf"):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                from langchain_community.document_loaders import PyPDFLoader
+                loader = PyPDFLoader(tmp_path)
+                docs   = await asyncio.to_thread(loader.load)
+            finally:
+                os.unlink(tmp_path)
+        else:
+            text = content.decode("utf-8", errors="replace")
+            docs = [Document(page_content=text, metadata={"source": filename})]
+
+        chunks = splitter.split_documents(docs)
+        if not chunks:
+            await uploads_col.update_one({"doc_id": doc_id}, {"$set": {"status": "failed", "error": "No content could be extracted."}})
+            return
+
+        await asyncio.to_thread(ensure_collection)
+        points = []
+        batch_size = 25
+
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i+batch_size]
+            texts = [c.page_content for c in batch_chunks]
+            
+            import time
+            start_t = time.time()
+            vectors = await embed_batch(texts, "retrieval_document")
+            duration = time.time() - start_t
+            print(f"[upload] Embedded batch of {len(texts)} chunks in {duration:.2f}s")
+
+            for j, vector in enumerate(vectors):
+                points.append(PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=vector,
+                    payload={
+                        "user_id":     user_id,
+                        "source":      filename,
+                        "chunk_index": i + j,
+                        "text":        texts[j],
+                    },
+                ))
+
+        await asyncio.to_thread(
+            qdrant.upsert, collection_name=COLLECTION_NAME, points=points
+        )
+        
+        await uploads_col.update_one({"doc_id": doc_id}, {"$set": {"status": "ready"}})
+    except Exception as e:
+        print(f"[upload] Task failed for {doc_id}: {e}")
+        await uploads_col.update_one({"doc_id": doc_id}, {"$set": {"status": "failed", "error": str(e)}})
+
+
 @app.post("/upload")
 @limiter.limit("20/minute")
-async def upload(request: Request, file: UploadFile = File(...), user_id: str = Depends(get_current_user_or_session)):
+async def upload(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...), user_id: str = Depends(get_current_user_or_session)):
     filename = file.filename or "document"
     
     if file.content_type not in ["application/pdf", "text/plain"]:
@@ -207,53 +277,30 @@ async def upload(request: Request, file: UploadFile = File(...), user_id: str = 
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File size exceeds 10MB limit.")
 
-    # Load with LangChain
-    if filename.lower().endswith(".pdf"):
-        # PyPDFLoader needs a real file path
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        try:
-            from langchain_community.document_loaders import PyPDFLoader
-            loader = PyPDFLoader(tmp_path)
-            docs   = await asyncio.to_thread(loader.load)
-        finally:
-            os.unlink(tmp_path)
-    else:
-        # Plain text / markdown
-        text = content.decode("utf-8", errors="replace")
-        docs = [Document(page_content=text, metadata={"source": filename})]
+    doc_id = str(uuid.uuid4())
+    await uploads_col.insert_one({
+        "doc_id": doc_id,
+        "filename": filename,
+        "user_id": user_id,
+        "status": "processing",
+        "timestamp": datetime.now(timezone.utc)
+    })
 
-    # Chunk
-    chunks = splitter.split_documents(docs)
-    if not chunks:
-        raise HTTPException(400, "No content could be extracted from the file.")
-
-    # Embed + upsert into Qdrant (lazy collection creation as fallback)
-    await asyncio.to_thread(ensure_collection)
-    points = []
-    for i, chunk in enumerate(chunks):
-        vector = await embed(chunk.page_content, "retrieval_document")
-        points.append(PointStruct(
-            id=str(uuid.uuid4()),
-            vector=vector,
-            payload={
-                "user_id":     user_id,
-                "source":      filename,
-                "chunk_index": i,
-                "text":        chunk.page_content,
-            },
-        ))
-
-    await asyncio.to_thread(
-        qdrant.upsert, collection_name=COLLECTION_NAME, points=points
-    )
+    background_tasks.add_task(process_upload_task, doc_id, filename, user_id, content)
 
     return {
-        "status": "ok",
+        "status": "processing",
+        "doc_id": doc_id,
         "file":   filename,
-        "chunks": len(chunks),
     }
+
+
+@app.get("/upload/status/{doc_id}")
+async def upload_status(doc_id: str, user_id: str = Depends(get_current_user_or_session)):
+    doc = await uploads_col.find_one({"doc_id": doc_id, "user_id": user_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    return {"status": doc["status"]}
 
 
 # ── POST /chat ────────────────────────────────────────────────────────────────
