@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { Send, Paperclip, Bot, User, LogOut, ChevronUp, ChevronDown, Menu, X } from "lucide-react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { Send, Paperclip, Bot, LogOut, ChevronUp, ChevronDown, Menu, X, Plus, MessageSquare } from "lucide-react";
 import { useSession, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -12,11 +12,26 @@ type Message = {
   timestamp?: string;
 };
 
+type Session = {
+  session_id: string;
+  title: string;
+  created_at: string;
+  message_count: number;
+};
+
+function generateSessionId(): string {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Math.random().toString(36).substring(2) + Date.now().toString(36);
+}
+
 export default function ChatPage() {
   const { data: session, status } = useSession();
   const router = useRouter();
 
   const [messages, setMessages] = useState<Message[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string>("");
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -24,15 +39,16 @@ export default function ChatPage() {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [guestSessionId, setGuestSessionId] = useState<string>("");
   const [guestMessageCount, setGuestMessageCount] = useState(0);
-  
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const API_BASE = "/api/py";
   const GUEST_LIMIT = 3;
 
+  // ── Init guest session ──────────────────────────────────────────
   useEffect(() => {
-    // Generate or load guest session
     let storedSession = localStorage.getItem("guest_session_id");
     if (!storedSession) {
       storedSession = Math.random().toString(36).substring(2, 15);
@@ -40,20 +56,23 @@ export default function ChatPage() {
     }
     setGuestSessionId(storedSession);
 
-    // Load guest count
     const count = parseInt(localStorage.getItem(`guest_count_${storedSession}`) || "0");
     setGuestMessageCount(count);
   }, []);
 
-  const getHeaders = () => {
-    const headers: Record<string, string> = {};
-    if (status === "authenticated" && (session as any)?.accessToken) {
-      headers["Authorization"] = `Bearer ${(session as any).accessToken}`;
-    } else {
-      headers["X-Session-ID"] = guestSessionId;
+  // ── Start fresh session on mount ────────────────────────────────
+  useEffect(() => {
+    if (!currentSessionId) {
+      setCurrentSessionId(generateSessionId());
     }
-    return headers;
-  };
+  }, []);
+
+  const getHeaders = useCallback((): Record<string, string> => {
+    if (status === "authenticated" && (session as any)?.accessToken) {
+      return { Authorization: `Bearer ${(session as any).accessToken}` };
+    }
+    return { "X-Session-ID": guestSessionId };
+  }, [status, session, guestSessionId]);
 
   const updateGuestCount = () => {
     if (status === "unauthenticated") {
@@ -65,25 +84,54 @@ export default function ChatPage() {
     return guestMessageCount;
   };
 
-  const fetchHistory = async () => {
+  // ── Fetch sessions list ─────────────────────────────────────────
+  const fetchSessions = useCallback(async () => {
     if (status === "loading" || (!guestSessionId && status === "unauthenticated")) return;
-    
+    setSessionsLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/history`, {
+      const res = await fetch(`${API_BASE}/sessions`, { headers: getHeaders() });
+      if (res.ok) {
+        const data: Session[] = await res.json();
+        setSessions(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch sessions", err);
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, [status, guestSessionId, getHeaders]);
+
+  // ── Load messages for a specific session ────────────────────────
+  const loadSession = useCallback(async (sessionId: string) => {
+    setCurrentSessionId(sessionId);
+    setMessages([]);
+    try {
+      const res = await fetch(`${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`, {
         headers: getHeaders(),
       });
       if (res.ok) {
-        const data = await res.json();
-        setMessages(data.messages || []);
+        const data: Message[] = await res.json();
+        setMessages(data || []);
         setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
       }
-    } catch (error) {
-      console.error("Failed to load history", error);
+    } catch (err) {
+      console.error("Failed to load session", err);
     }
-  };
+    setSidebarOpen(false);
+  }, [getHeaders]);
 
+  // Start a brand new conversation
+  const startNewChat = useCallback(() => {
+    setCurrentSessionId(generateSessionId());
+    setMessages([]);
+    setSidebarOpen(false);
+  }, []);
+
+  // Load sessions when auth state is ready
   useEffect(() => {
-    fetchHistory();
+    if (status !== "loading") {
+      fetchSessions();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, guestSessionId]);
 
@@ -91,6 +139,7 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // ── Send message ────────────────────────────────────────────────
   const sendMessage = async (e?: React.FormEvent, textOverride?: string) => {
     e?.preventDefault();
     const textToSend = textOverride || inputText;
@@ -106,7 +155,6 @@ export default function ChatPage() {
     setMessages((prev) => [...prev, newUserMsg]);
     setInputText("");
     setIsLoading(true);
-
     updateGuestCount();
 
     try {
@@ -116,15 +164,19 @@ export default function ChatPage() {
           "Content-Type": "application/json",
           ...getHeaders(),
         },
-        body: JSON.stringify({ message: textToSend }),
+        body: JSON.stringify({ message: textToSend, session_id: currentSessionId }),
       });
-      
+
       if (!res.ok) {
-        throw new Error("Failed to send message");
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Failed to send message");
       }
-      
+
       const data = await res.json();
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+
+      // Refresh sidebar sessions (debounced — only when we actually sent)
+      setTimeout(() => fetchSessions(), 500);
     } catch (error: any) {
       console.error(error);
       setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${error.message}` }]);
@@ -132,6 +184,7 @@ export default function ChatPage() {
     setIsLoading(false);
   };
 
+  // ── File upload ─────────────────────────────────────────────────
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -155,10 +208,8 @@ export default function ChatPage() {
       if (res.ok) {
         const data = await res.json();
         const docId = data.doc_id;
-        
         if (fileInputRef.current) fileInputRef.current.value = "";
-        
-        // Poll for status
+
         const pollStatus = setInterval(async () => {
           try {
             const statusRes = await fetch(`${API_BASE}/upload/status/${docId}`, { headers: getHeaders() });
@@ -181,8 +232,8 @@ export default function ChatPage() {
             setIsUploading(false);
           }
         }, 2000);
-        
-        return; // Don't set isUploading=false yet
+
+        return;
       } else {
         const err = await res.json();
         throw new Error(err.detail || "Upload failed");
@@ -195,10 +246,6 @@ export default function ChatPage() {
     }
   };
 
-  const handleSuggestionClick = (text: string) => {
-    sendMessage(undefined, text);
-  };
-
   if (status === "loading") {
     return (
       <div className="flex h-screen w-full items-center justify-center bg-[#0f0f11]">
@@ -208,62 +255,119 @@ export default function ChatPage() {
   }
 
   const isGuestLimitReached = status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT;
-  
-  const displayName = session?.user?.name 
-    ? session.user.name.split(" ")[0] 
-    : (status === "unauthenticated" ? "Guest" : "Tharun");
+
+  const displayName = session?.user?.name
+    ? session.user.name.split(" ")[0]
+    : status === "unauthenticated"
+    ? "Guest"
+    : "Tharun";
+
+  // Format relative time for sidebar
+  const relativeTime = (iso: string) => {
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  };
 
   return (
     <div className="flex h-screen w-full bg-[#0f0f11] text-zinc-100 overflow-hidden font-sans relative">
-      
+
       {/* Mobile Sidebar Overlay */}
       {sidebarOpen && (
-        <div 
+        <div
           className="fixed inset-0 bg-black/60 z-20 md:hidden backdrop-blur-sm"
           onClick={() => setSidebarOpen(false)}
         />
       )}
 
-      {/* Minimal Sidebar */}
+      {/* Sidebar */}
       <aside className={`absolute md:static transition-all duration-300 ease-in-out border-r border-zinc-900 bg-zinc-950 flex flex-col items-center py-6 h-full z-30 ${sidebarOpen ? "translate-x-0 w-64 px-4" : "-translate-x-full md:translate-x-0 w-16"}`}>
-        
+
         {/* Top Actions */}
         <div className="flex flex-col gap-4 w-full items-center">
-          <button 
+          <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
             className="hidden md:flex p-2 rounded-xl text-zinc-400 hover:text-white hover:bg-zinc-900 transition-colors self-center"
           >
             <Menu className="w-5 h-5" />
           </button>
-          
+
           <button className="md:hidden p-2 rounded-xl text-zinc-400 self-end" onClick={() => setSidebarOpen(false)}>
-             <X className="w-5 h-5" />
+            <X className="w-5 h-5" />
           </button>
-          
-          <button 
-            onClick={() => { setMessages([]); setSidebarOpen(false); }}
+
+          {/* New Chat Button */}
+          <button
+            onClick={startNewChat}
             className={`flex items-center gap-3 p-2 rounded-xl text-zinc-300 hover:text-white hover:bg-zinc-900 transition-colors w-full ${sidebarOpen ? "justify-start px-3" : "justify-center"}`}
+            title="New chat"
           >
-            <Send className="w-5 h-5" />
+            <Plus className="w-5 h-5" />
             {sidebarOpen && <span className="text-sm font-medium">New chat</span>}
           </button>
         </div>
 
         {/* History Area */}
-        <div className="flex-1 w-full overflow-y-auto mt-8 flex flex-col gap-2 no-scrollbar">
+        <div className="flex-1 w-full overflow-y-auto mt-6 flex flex-col gap-1 no-scrollbar">
           {sidebarOpen && (
             <div className="text-xs font-semibold text-zinc-600 uppercase tracking-wider mb-2 px-2">History</div>
           )}
-          {sidebarOpen && [1, 2, 3].map((i) => (
-            <button key={i} className="text-left w-full p-2 text-sm text-zinc-400 hover:text-white hover:bg-zinc-900 rounded-lg truncate transition-colors">
-              Chat session {i}
+
+          {sidebarOpen && (
+            sessionsLoading ? (
+              <div className="px-2 py-4 flex flex-col gap-2">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="h-9 rounded-lg bg-zinc-900 animate-pulse" />
+                ))}
+              </div>
+            ) : sessions.length === 0 ? (
+              <p className="text-xs text-zinc-600 px-2 py-3">No conversations yet</p>
+            ) : (
+              sessions.map((s) => (
+                <button
+                  key={s.session_id}
+                  onClick={() => loadSession(s.session_id)}
+                  title={s.title}
+                  className={`group text-left w-full px-3 py-2.5 rounded-xl transition-colors flex items-start gap-2 ${
+                    s.session_id === currentSessionId
+                      ? "bg-zinc-800 text-white"
+                      : "text-zinc-400 hover:text-white hover:bg-zinc-900"
+                  }`}
+                >
+                  <MessageSquare className="w-3.5 h-3.5 mt-0.5 shrink-0 text-zinc-600 group-hover:text-zinc-400" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm truncate leading-tight">{s.title}</p>
+                    <p className="text-[10px] text-zinc-600 mt-0.5">{relativeTime(s.created_at)}</p>
+                  </div>
+                </button>
+              ))
+            )
+          )}
+
+          {/* Collapsed state: just icons */}
+          {!sidebarOpen && sessions.slice(0, 8).map((s) => (
+            <button
+              key={s.session_id}
+              onClick={() => loadSession(s.session_id)}
+              title={s.title}
+              className={`flex justify-center p-2 rounded-xl transition-colors w-full ${
+                s.session_id === currentSessionId
+                  ? "bg-zinc-800 text-white"
+                  : "text-zinc-600 hover:text-white hover:bg-zinc-900"
+              }`}
+            >
+              <MessageSquare className="w-4 h-4" />
             </button>
           ))}
         </div>
 
         {/* User Profile */}
         <div className="mt-auto w-full relative">
-          <button 
+          <button
             onClick={() => setUserMenuOpen(!userMenuOpen)}
             className={`flex items-center gap-3 p-2 rounded-xl hover:bg-zinc-900 transition-colors w-full ${sidebarOpen ? "justify-between px-3" : "justify-center"}`}
           >
@@ -278,16 +382,17 @@ export default function ChatPage() {
             {sidebarOpen && <ChevronUp className="w-4 h-4 text-zinc-500 shrink-0" />}
           </button>
 
-          {/* User Menu Dropdown */}
           {userMenuOpen && (
             <div className={`absolute bottom-full left-0 mb-2 bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl py-1 z-50 ${sidebarOpen ? "w-full" : "w-48 ml-2"}`}>
               {status === "authenticated" ? (
                 <>
                   <div className="px-3 py-2 border-b border-zinc-800 mb-1">
                     <p className="text-sm font-medium text-white truncate">{session.user.name}</p>
-                    <p className="text-xs text-zinc-400 truncate">{(session.user as any).username ? `@${(session.user as any).username}` : session.user.email}</p>
+                    <p className="text-xs text-zinc-400 truncate">
+                      {(session.user as any).username ? `@${(session.user as any).username}` : session.user.email}
+                    </p>
                   </div>
-                  <button 
+                  <button
                     onClick={() => signOut()}
                     className="w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-zinc-800 flex items-center gap-2"
                   >
@@ -307,7 +412,7 @@ export default function ChatPage() {
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col relative h-full min-w-0">
-        
+
         {/* Mobile Header */}
         <header className="md:hidden flex items-center p-4 border-b border-zinc-900 z-10 shrink-0 bg-[#0f0f11]/80 backdrop-blur-md">
           <button onClick={() => setSidebarOpen(true)} className="p-2 -ml-2 text-zinc-400">
@@ -316,7 +421,7 @@ export default function ChatPage() {
           <span className="font-semibold text-white ml-2 tracking-wide text-sm">Ragasiyam</span>
         </header>
 
-        {/* Subtle radial glow in the center */}
+        {/* Subtle radial glow */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-blue-900/10 rounded-full blur-[120px] pointer-events-none" />
 
         {/* Chat Area */}
@@ -332,8 +437,8 @@ export default function ChatPage() {
               {messages.map((m, idx) => (
                 <div key={idx} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
                   <div className={`max-w-[85%] rounded-3xl px-5 py-3.5 ${
-                    m.role === "user" 
-                      ? "bg-zinc-800 text-zinc-100" 
+                    m.role === "user"
+                      ? "bg-zinc-800 text-zinc-100"
                       : "bg-transparent text-zinc-300"
                   }`}>
                     {m.role === "assistant" && (
@@ -371,17 +476,19 @@ export default function ChatPage() {
 
         {/* Input Area */}
         <div className="absolute bottom-0 left-0 right-0 p-4 md:px-8 pb-8 bg-gradient-to-t from-[#0f0f11] via-[#0f0f11] to-transparent z-20">
-          
+
           {isGuestLimitReached && (
             <div className="max-w-3xl mx-auto mb-4 p-3 bg-indigo-950/50 border border-indigo-900/50 rounded-xl text-indigo-200 text-sm text-center backdrop-blur-md">
-              You've reached your free guest limit. <Link href="/signup" className="font-semibold underline hover:text-white">Sign up</Link> to continue chatting and uploading documents.
+              You've reached your free guest limit.{" "}
+              <Link href="/signup" className="font-semibold underline hover:text-white">Sign up</Link>{" "}
+              to continue chatting and uploading documents.
             </div>
           )}
 
           <div className="max-w-3xl mx-auto relative">
-            <div className={`bg-zinc-900/80 backdrop-blur-xl border border-zinc-800/80 rounded-full flex items-center px-2 py-2 shadow-2xl transition-all focus-within:border-zinc-700 focus-within:bg-zinc-900 focus-within:ring-1 focus-within:ring-zinc-700 ${isGuestLimitReached ? 'opacity-50 pointer-events-none' : ''}`}>
-              
-              <button 
+            <div className={`bg-zinc-900/80 backdrop-blur-xl border border-zinc-800/80 rounded-full flex items-center px-2 py-2 shadow-2xl transition-all focus-within:border-zinc-700 focus-within:bg-zinc-900 focus-within:ring-1 focus-within:ring-zinc-700 ${isGuestLimitReached ? "opacity-50 pointer-events-none" : ""}`}>
+
+              <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isUploading || isGuestLimitReached}
                 className="p-3 text-blue-500 hover:bg-zinc-800 rounded-full transition-colors shrink-0 disabled:opacity-50 flex items-center justify-center ml-1"
@@ -389,12 +496,12 @@ export default function ChatPage() {
               >
                 {isUploading ? <div className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" /> : <Paperclip className="w-5 h-5" />}
               </button>
-              
-              <input 
-                type="file" 
+
+              <input
+                type="file"
                 ref={fileInputRef}
-                onChange={handleFileUpload} 
-                className="hidden" 
+                onChange={handleFileUpload}
+                className="hidden"
                 accept=".txt,.pdf"
               />
 
@@ -414,13 +521,12 @@ export default function ChatPage() {
               />
 
               <div className="flex items-center pr-2 shrink-0 gap-2">
-                {/* Model Indicator Pill */}
                 <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full hover:bg-zinc-800 transition-colors cursor-pointer text-xs font-medium text-zinc-300 select-none border border-transparent hover:border-zinc-700">
                   <div className="w-2 h-2 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]" />
                   Pro
                   <ChevronDown className="w-3.5 h-3.5 text-zinc-500" />
                 </div>
-                
+
                 <button
                   onClick={() => sendMessage()}
                   disabled={!inputText.trim() || isLoading || isGuestLimitReached}
