@@ -15,12 +15,17 @@ import threading
 import json
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 import google.generativeai as genai
+import jwt
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from motor.motor_asyncio import AsyncIOMotorClient
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -38,9 +43,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGODB_URI    = os.getenv("MONGODB_URI")
 QDRANT_HOST    = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT    = int(os.getenv("QDRANT_PORT", "6333"))
+JWT_SECRET     = os.getenv("JWT_SECRET")
 
 if not GEMINI_API_KEY: raise RuntimeError("GEMINI_API_KEY not set in .env")
 if not MONGODB_URI:    raise RuntimeError("MONGODB_URI not set in .env")
+if not JWT_SECRET:     raise RuntimeError("JWT_SECRET not set in .env")
+
+limiter = Limiter(key_func=get_remote_address)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
@@ -65,13 +75,26 @@ splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(title="Ragasiyam", version="0.3.0")
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for dev
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication token")
+        return user_id
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -109,12 +132,10 @@ async def root():
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    session_id: str
     message: str
 
 class ChatResponse(BaseModel):
     reply: str
-    session_id: str
     grounded: bool   # True = RAG context was injected
 
 class MessageOut(BaseModel):
@@ -137,10 +158,10 @@ async def embed(text: str, task_type: str = "retrieval_document") -> list[float]
 
 
 # ── MongoDB helpers ───────────────────────────────────────────────────────────
-async def load_history(session_id: str) -> list[dict]:
+async def load_history(user_id: str) -> list[dict]:
     """Return chat history in Gemini SDK format."""
     cursor = chats_col.find(
-        {"session_id": session_id},
+        {"user_id": user_id},
         {"_id": 0, "role": 1, "content": 1},
     ).sort("timestamp", 1)
 
@@ -150,9 +171,9 @@ async def load_history(session_id: str) -> list[dict]:
         history.append({"role": gemini_role, "parts": [doc["content"]]})
     return history
 
-async def save_message(session_id: str, role: str, content: str):
+async def save_message(user_id: str, role: str, content: str):
     await chats_col.insert_one({
-        "session_id": session_id,
+        "user_id":    user_id,
         "role":       role,
         "content":    content,
         "timestamp":  datetime.now(timezone.utc),
@@ -161,9 +182,16 @@ async def save_message(session_id: str, role: str, content: str):
 
 # ── POST /upload ──────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
+@limiter.limit("20/minute")
+async def upload(request: Request, file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
     filename = file.filename or "document"
-    content  = await file.read()
+    
+    if file.content_type not in ["application/pdf", "text/plain"]:
+        raise HTTPException(status_code=400, detail="Only PDF and TXT files are allowed.")
+    
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds 10MB limit.")
 
     # Load with LangChain
     if filename.lower().endswith(".pdf"):
@@ -196,7 +224,7 @@ async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
             id=str(uuid.uuid4()),
             vector=vector,
             payload={
-                "session_id":  session_id,
+                "user_id":     user_id,
                 "source":      filename,
                 "chunk_index": i,
                 "text":        chunk.page_content,
@@ -211,18 +239,18 @@ async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
         "status": "ok",
         "file":   filename,
         "chunks": len(chunks),
-        "session": session_id,
     }
 
 
 # ── POST /chat ────────────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+@limiter.limit("20/minute")
+async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user)):
     if not req.message.strip():
         raise HTTPException(400, "message cannot be empty")
 
     # Persist user turn
-    await save_message(req.session_id, "user", req.message)
+    await save_message(user_id, "user", req.message)
 
     # 1. Embed the query and search Qdrant (scoped to this session)
     query_vector = await embed(req.message, "retrieval_query")
@@ -232,7 +260,7 @@ async def chat(req: ChatRequest):
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         query_filter=Filter(must=[
-            FieldCondition(key="session_id", match=MatchValue(value=req.session_id))
+            FieldCondition(key="user_id", match=MatchValue(value=user_id))
         ]),
         limit=TOP_K,
         with_payload=True,
@@ -242,7 +270,7 @@ async def chat(req: ChatRequest):
     grounded = len(relevant) > 0
 
     # 2. Load prior conversation history
-    history      = await load_history(req.session_id)
+    history      = await load_history(user_id)
     prior_history = history[:-1]   # exclude the turn we just saved
 
     model        = genai.GenerativeModel(MODEL_NAME)
@@ -276,16 +304,16 @@ async def chat(req: ChatRequest):
         raise HTTPException(502, f"Gemini error: {exc}") from exc
 
     reply_text = response.text
-    await save_message(req.session_id, "assistant", reply_text)
+    await save_message(user_id, "assistant", reply_text)
 
-    return ChatResponse(reply=reply_text, session_id=req.session_id, grounded=grounded)
+    return ChatResponse(reply=reply_text, grounded=grounded)
 
 
-# ── GET /history/{session_id} ─────────────────────────────────────────────────
-@app.get("/history/{session_id}", response_model=list[MessageOut])
-async def get_history(session_id: str):
+# ── GET /history ─────────────────────────────────────────────────
+@app.get("/history", response_model=list[MessageOut])
+async def get_history(user_id: str = Depends(get_current_user)):
     cursor = chats_col.find(
-        {"session_id": session_id},
+        {"user_id": user_id},
         {"_id": 0, "role": 1, "content": 1, "timestamp": 1},
     ).sort("timestamp", 1)
 
@@ -298,30 +326,7 @@ async def get_history(session_id: str):
         ))
     return messages
 
-
-# ── GET /sessions ─────────────────────────────────────────────────────────────
-@app.get("/sessions")
-async def get_sessions():
-    # Aggregation to get unique sessions and their first message
-    pipeline = [
-        {"$sort": {"timestamp": 1}},
-        {"$group": {
-            "_id": "$session_id",
-            "first_message": {"$first": "$content"},
-            "timestamp": {"$first": "$timestamp"}
-        }},
-        {"$sort": {"timestamp": -1}}
-    ]
-    cursor = chats_col.aggregate(pipeline)
-    
-    sessions = []
-    async for doc in cursor:
-        sessions.append({
-            "session_id": doc["_id"],
-            "first_message": doc["first_message"],
-            "timestamp": doc["timestamp"].isoformat() if doc.get("timestamp") else None
-        })
-    return sessions
+    return messages
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────
@@ -352,12 +357,13 @@ async def health():
 
 # ── POST /chat/stream  (Server-Sent Events) ────────────────────────────────────────
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+@limiter.limit("20/minute")
+async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user)):
     """Same RAG logic as /chat, but streams the reply via SSE chunks."""
     if not req.message.strip():
         raise HTTPException(400, "message cannot be empty")
 
-    await save_message(req.session_id, "user", req.message)
+    await save_message(user_id, "user", req.message)
 
     # RAG retrieval (same as /chat)
     query_vector = await embed(req.message, "retrieval_query")
@@ -366,7 +372,7 @@ async def chat_stream(req: ChatRequest):
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         query_filter=Filter(must=[
-            FieldCondition(key="session_id", match=MatchValue(value=req.session_id))
+            FieldCondition(key="user_id", match=MatchValue(value=user_id))
         ]),
         limit=TOP_K,
         with_payload=True,
@@ -374,7 +380,7 @@ async def chat_stream(req: ChatRequest):
     relevant = [r for r in results if r.score >= SIMILARITY_THRESHOLD]
     grounded = len(relevant) > 0
 
-    history      = await load_history(req.session_id)
+    history      = await load_history(user_id)
     prior_history = history[:-1]
 
     model_obj = genai.GenerativeModel(MODEL_NAME)
@@ -429,7 +435,7 @@ async def chat_stream(req: ChatRequest):
                 break
             elif kind == "done":
                 # Persist the complete reply now that streaming finished
-                await save_message(req.session_id, "assistant", full_reply)
+                await save_message(user_id, "assistant", full_reply)
                 final = json.dumps({"text": "", "done": True, "grounded": grounded})
                 yield f"data: {final}\n\n"
                 break

@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { MessageSquare, Plus, Menu, X, Send, Paperclip, Bot, User } from "lucide-react";
+import { Send, Paperclip, Bot, User, LogOut } from "lucide-react";
+import { useSession, signOut } from "next-auth/react";
+import { useRouter } from "next/navigation";
 
 type Message = {
   role: "user" | "assistant";
@@ -9,18 +11,12 @@ type Message = {
   timestamp?: string;
 };
 
-type Session = {
-  session_id: string;
-  first_message: string;
-  timestamp: string | null;
-};
-
 export default function ChatPage() {
-  const [sessionId, setSessionId] = useState<string>("");
+  const { data: session, status } = useSession();
+  const router = useRouter();
+
   const [messages, setMessages] = useState<Message[]>([]);
-  const [sessions, setSessions] = useState<Session[]>([]);
   const [inputText, setInputText] = useState("");
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   
@@ -29,60 +25,46 @@ export default function ChatPage() {
 
   const API_BASE = "http://localhost:8000";
 
-  // Initialize session and fetch history
+  // Redirect if unauthenticated
   useEffect(() => {
-    if (!sessionId) {
-      startNewChat();
+    if (status === "unauthenticated") {
+      router.push("/login");
     }
-    fetchSessions();
-  }, []);
+  }, [status, router]);
 
-  // Scroll to bottom when messages change
+  // Fetch user history once authenticated
+  useEffect(() => {
+    if (status === "authenticated" && (session as any)?.accessToken) {
+      fetchHistory();
+    }
+  }, [status, session]);
+
+  // Scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const startNewChat = () => {
-    setSessionId(crypto.randomUUID());
-    setMessages([]);
-    setInputText("");
-  };
-
-  const fetchSessions = async () => {
+  const fetchHistory = async () => {
     try {
-      const res = await fetch(`${API_BASE}/sessions`);
-      if (res.ok) {
-        const data = await res.json();
-        setSessions(data);
-      }
-    } catch (error) {
-      console.error("Failed to fetch sessions", error);
-    }
-  };
-
-  const loadSession = async (id: string) => {
-    setSessionId(id);
-    setIsLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/history/${id}`);
+      const res = await fetch(`${API_BASE}/history`, {
+        headers: {
+          Authorization: `Bearer ${(session as any)?.accessToken}`,
+        },
+      });
       if (res.ok) {
         const data = await res.json();
         setMessages(data);
       }
     } catch (error) {
-      console.error("Failed to load session", error);
+      console.error("Failed to fetch history", error);
     }
-    setIsLoading(false);
-    
-    // Auto-close sidebar on mobile after selection
-    if (window.innerWidth < 768) setIsSidebarOpen(false);
   };
 
   const sendMessage = async (e?: React.FormEvent, textOverride?: string) => {
     if (e) e.preventDefault();
     
     const textToSend = textOverride || inputText;
-    if (!textToSend.trim() || isLoading) return;
+    if (!textToSend.trim() || isLoading || !(session as any)?.accessToken) return;
 
     const userMessage: Message = { role: "user", content: textToSend };
     setMessages((prev) => [...prev, userMessage]);
@@ -92,46 +74,53 @@ export default function ChatPage() {
     try {
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, message: textToSend }),
+        headers: { 
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${(session as any).accessToken}`,
+        },
+        body: JSON.stringify({ message: textToSend }),
       });
 
-      if (!res.ok) throw new Error("Failed to send message");
+      if (!res.ok) {
+        if (res.status === 429) throw new Error("Rate limit exceeded. Please wait a moment.");
+        if (res.status === 401) signOut();
+        throw new Error("Failed to send message");
+      }
       
       const data = await res.json();
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
-      
-      // Refresh sidebar list if it's the first message
-      if (messages.length === 0) fetchSessions();
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      setMessages((prev) => [...prev, { role: "assistant", content: "Error: Could not connect to backend." }]);
+      setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${error.message}` }]);
     }
     setIsLoading(false);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || !(session as any)?.accessToken) return;
 
     setIsUploading(true);
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("session_id", sessionId);
 
     try {
       const res = await fetch(`${API_BASE}/upload`, {
         method: "POST",
+        headers: {
+          Authorization: `Bearer ${(session as any).accessToken}`,
+        },
         body: formData,
       });
       if (res.ok) {
         setMessages((prev) => [...prev, { role: "assistant", content: `Successfully ingested document: ${file.name}` }]);
       } else {
-        throw new Error("Upload failed");
+        const err = await res.json();
+        throw new Error(err.detail || "Upload failed");
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      alert("Failed to upload document");
+      alert(error.message || "Failed to upload document");
     }
     setIsUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -141,205 +130,171 @@ export default function ChatPage() {
     sendMessage(undefined, text);
   };
 
-  return (
-    <div className="flex w-full h-full bg-zinc-50 text-zinc-900">
-      
-      {/* Sidebar Overlay (Mobile) */}
-      {isSidebarOpen && (
-        <div 
-          className="fixed inset-0 bg-black/20 z-40 md:hidden" 
-          onClick={() => setIsSidebarOpen(false)}
-        />
-      )}
+  if (status === "loading" || status === "unauthenticated") {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-zinc-50">
+        <div className="animate-pulse text-zinc-400">Loading...</div>
+      </div>
+    );
+  }
 
-      {/* Sidebar */}
-      <aside 
-        className={`${isSidebarOpen ? "translate-x-0" : "-translate-x-full"} 
-          fixed md:relative z-50 flex flex-col w-64 h-full bg-white border-r border-zinc-200 transition-transform duration-300 ease-in-out`}
-      >
-        <div className="p-4 border-b border-zinc-100 flex items-center justify-between">
+  return (
+    <div className="flex flex-col w-full h-screen bg-zinc-50 text-zinc-900 relative">
+      {/* Header */}
+      <header className="flex-shrink-0 h-14 border-b border-zinc-200 bg-white px-4 flex items-center justify-between z-10">
+        <div className="flex items-center gap-2 font-medium text-zinc-800">
+          <Bot className="w-5 h-5 text-blue-600" />
+          Ragasiyam
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-zinc-500">{session?.user?.email}</span>
           <button 
-            onClick={startNewChat}
-            className="flex-1 flex items-center justify-center gap-2 bg-zinc-900 hover:bg-zinc-800 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+            onClick={() => signOut()} 
+            className="text-zinc-500 hover:text-zinc-800 p-2 rounded-md hover:bg-zinc-100 transition-colors"
+            title="Log out"
           >
-            <Plus size={16} /> New chat
-          </button>
-          <button 
-            onClick={() => setIsSidebarOpen(false)}
-            className="md:hidden ml-2 p-2 text-zinc-500 hover:bg-zinc-100 rounded-md"
-          >
-            <X size={20} />
+            <LogOut className="w-4 h-4" />
           </button>
         </div>
+      </header>
 
-        <div className="flex-1 overflow-y-auto p-3">
-          <p className="text-xs font-semibold text-zinc-500 mb-2 px-2 uppercase tracking-wider">History</p>
-          {sessions.length === 0 ? (
-            <p className="text-sm text-zinc-400 px-2 italic">No past sessions</p>
-          ) : (
-            <div className="flex flex-col gap-1">
-              {sessions.map((s) => (
+      {/* Main Chat Area */}
+      <main className="flex-1 overflow-y-auto relative bg-zinc-50">
+        {messages.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full max-w-2xl mx-auto px-4 pt-10 pb-32">
+            <div className="w-16 h-16 bg-blue-100 rounded-2xl flex items-center justify-center mb-6 shadow-sm border border-blue-200">
+              <Bot className="w-8 h-8 text-blue-600" />
+            </div>
+            <h1 className="text-3xl font-semibold text-zinc-800 mb-2 text-center">What can I help with?</h1>
+            <p className="text-zinc-500 text-center mb-10 max-w-md leading-relaxed">
+              Upload your documents and ask anything. I will securely answer strictly based on your files.
+            </p>
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+              {[
+                "Summarize the key points in my document.",
+                "What are the action items?",
+                "Extract any names and dates.",
+                "Explain the main concept simply."
+              ].map((suggestion, idx) => (
                 <button
-                  key={s.session_id}
-                  onClick={() => loadSession(s.session_id)}
-                  className={`flex items-start gap-3 p-2 rounded-lg text-left transition-colors ${
-                    s.session_id === sessionId ? "bg-zinc-100 text-zinc-900" : "text-zinc-600 hover:bg-zinc-50"
-                  }`}
+                  key={idx}
+                  onClick={() => handleSuggestionClick(suggestion)}
+                  className="p-4 bg-white border border-zinc-200 rounded-xl text-left text-sm text-zinc-600 hover:border-zinc-300 hover:bg-zinc-50 transition-all shadow-sm"
                 >
-                  <MessageSquare size={16} className="mt-0.5 shrink-0 opacity-70" />
-                  <span className="text-sm truncate font-medium">
-                    {s.first_message || "Empty chat"}
-                  </span>
+                  {suggestion}
                 </button>
               ))}
             </div>
-          )}
-        </div>
-      </aside>
-
-      {/* Main Area */}
-      <main className="flex-1 flex flex-col min-w-0 bg-white relative">
-        {/* Mobile Header */}
-        <header className="h-14 border-b border-zinc-200 flex items-center px-4 bg-white/80 backdrop-blur-sm z-30 shrink-0 md:hidden">
-          <button 
-            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="p-2 -ml-2 text-zinc-600 hover:bg-zinc-100 rounded-md transition-colors"
-          >
-            <Menu size={20} />
-          </button>
-          <span className="ml-3 font-semibold text-zinc-800">Ragasiyam Assistant</span>
-        </header>
-        
-        {/* Desktop toggle if sidebar closed */}
-        {!isSidebarOpen && (
-           <button 
-            onClick={() => setIsSidebarOpen(true)}
-            className="absolute top-4 left-4 p-2 z-30 text-zinc-600 bg-white hover:bg-zinc-100 border border-zinc-200 rounded-md transition-colors hidden md:block shadow-sm"
-          >
-            <Menu size={20} />
-          </button>
-        )}
-
-        {/* Chat Content */}
-        <div className="flex-1 overflow-y-auto p-4 md:p-8 scroll-smooth pb-32">
-          <div className="max-w-3xl mx-auto h-full flex flex-col">
-            
-            {messages.length === 0 ? (
-              <div className="m-auto w-full flex flex-col items-center justify-center animate-in fade-in duration-500">
-                <h1 className="text-3xl font-bold text-zinc-800 mb-2">What can I help with?</h1>
-                <p className="text-zinc-500 mb-8 text-center max-w-sm">Upload documents to provide context to the assistant and start asking questions.</p>
-                
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl">
-                  {[
-                    "Summarize the key points of the uploaded document.",
-                    "What are the action items mentioned?",
-                    "Explain the main concepts in simple terms.",
-                    "Extract any names, dates, or specific numbers."
-                  ].map((suggestion, i) => (
-                    <button 
-                      key={i}
-                      onClick={() => handleSuggestionClick(suggestion)}
-                      className="p-4 rounded-xl border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 hover:border-zinc-300 transition-all text-left group shadow-sm"
-                    >
-                      <p className="text-sm font-medium text-zinc-700 group-hover:text-zinc-900 leading-snug">{suggestion}</p>
-                    </button>
-                  ))}
+          </div>
+        ) : (
+          <div className="flex flex-col w-full max-w-3xl mx-auto pb-32 pt-8">
+            {messages.map((msg, i) => (
+              <div 
+                key={i} 
+                className={`flex w-full mb-6 px-4 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                <div className={`flex gap-4 max-w-[85%] ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 mt-1 ${
+                    msg.role === "user" 
+                      ? "bg-zinc-200 text-zinc-600" 
+                      : "bg-blue-600 text-white shadow-sm"
+                  }`}>
+                    {msg.role === "user" ? <User className="w-5 h-5" /> : <Bot className="w-5 h-5" />}
+                  </div>
+                  
+                  <div className={`px-5 py-3.5 rounded-2xl leading-relaxed text-[15px] ${
+                    msg.role === "user" 
+                      ? "bg-zinc-100 text-zinc-800 rounded-tr-sm" 
+                      : "bg-white text-zinc-800 border border-zinc-200 shadow-sm rounded-tl-sm whitespace-pre-wrap"
+                  }`}>
+                    {msg.content}
+                  </div>
                 </div>
               </div>
-            ) : (
-              <div className="flex flex-col gap-6 w-full pb-8">
-                {messages.map((msg, i) => (
-                  <div key={i} className={`flex gap-4 ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                    
-                    {msg.role === "assistant" && (
-                      <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center shrink-0 mt-1">
-                        <Bot size={18} className="text-blue-600" />
-                      </div>
-                    )}
-                    
-                    <div className={`px-5 py-3 rounded-2xl max-w-[85%] text-[15px] leading-relaxed shadow-sm ${
-                      msg.role === "user" 
-                        ? "bg-zinc-900 text-white rounded-br-sm" 
-                        : "bg-white border border-zinc-200 text-zinc-800 rounded-bl-sm"
-                    }`}>
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
-                    </div>
-
-                    {msg.role === "user" && (
-                      <div className="w-8 h-8 rounded-full bg-zinc-100 border border-zinc-200 flex items-center justify-center shrink-0 mt-1">
-                        <User size={18} className="text-zinc-600" />
-                      </div>
-                    )}
-
+            ))}
+            
+            {isLoading && (
+              <div className="flex w-full mb-6 px-4 justify-start">
+                <div className="flex gap-4 max-w-[85%] flex-row">
+                  <div className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center flex-shrink-0 mt-1 shadow-sm">
+                    <Bot className="w-5 h-5" />
                   </div>
-                ))}
-                
-                {isLoading && (
-                  <div className="flex gap-4 justify-start">
-                     <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center shrink-0 mt-1">
-                        <Bot size={18} className="text-blue-600" />
-                      </div>
-                      <div className="px-5 py-3 rounded-2xl bg-white border border-zinc-200 text-zinc-500 rounded-bl-sm flex gap-1.5 items-center shadow-sm h-12">
-                        <div className="w-1.5 h-1.5 bg-zinc-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-                        <div className="w-1.5 h-1.5 bg-zinc-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-                        <div className="w-1.5 h-1.5 bg-zinc-400 rounded-full animate-bounce"></div>
-                      </div>
+                  <div className="px-5 py-4 rounded-2xl bg-white border border-zinc-200 shadow-sm rounded-tl-sm flex items-center gap-2">
+                    <span className="w-2 h-2 bg-blue-600 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                    <span className="w-2 h-2 bg-blue-600 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                    <span className="w-2 h-2 bg-blue-600 rounded-full animate-bounce"></span>
                   </div>
-                )}
-                <div ref={messagesEndRef} />
+                </div>
               </div>
             )}
+            
+            {isUploading && (
+              <div className="flex w-full mb-6 px-4 justify-start">
+                <div className="px-5 py-3 rounded-xl bg-blue-50 text-blue-700 text-sm border border-blue-100 flex items-center ml-12">
+                  <span className="animate-pulse flex items-center">
+                    <Paperclip className="w-4 h-4 mr-2" />
+                    Ingesting document...
+                  </span>
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
           </div>
-        </div>
-
-        {/* Input Bar Fixed Bottom */}
-        <div className="absolute bottom-0 left-0 w-full bg-gradient-to-t from-white via-white to-transparent pt-8 pb-6 px-4 md:px-8">
-          <div className="max-w-3xl mx-auto relative">
-            <form 
-              onSubmit={sendMessage}
-              className="flex items-end gap-2 bg-white border border-zinc-300 rounded-3xl shadow-sm pr-2 pl-2 py-2 focus-within:ring-2 focus-within:ring-zinc-900 focus-within:border-zinc-900 transition-all"
-            >
-              <input type="file" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
-              <button 
-                type="button" 
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isUploading}
-                title="Attach Document"
-                className="p-3 text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100 rounded-full transition-colors disabled:opacity-50 shrink-0"
-              >
-                <Paperclip size={20} />
-              </button>
-              
-              <textarea
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                  }
-                }}
-                placeholder="Message Ragasiyam..."
-                disabled={isLoading}
-                rows={1}
-                className="flex-1 bg-transparent outline-none py-3 text-[15px] placeholder:text-zinc-400 resize-none max-h-32 min-h-12 overflow-y-auto"
-              />
-              
-              <button
-                type="submit"
-                disabled={!inputText.trim() || isLoading}
-                className="p-3 bg-zinc-900 text-white rounded-full hover:bg-zinc-800 transition-colors disabled:opacity-50 disabled:bg-zinc-200 disabled:text-zinc-400 shrink-0"
-              >
-                <Send size={18} className="ml-0.5" />
-              </button>
-            </form>
-            <p className="text-center text-[11px] text-zinc-400 mt-3 font-medium">
-              Ragasiyam can make mistakes. Consider verifying important information.
-            </p>
-          </div>
-        </div>
-
+        )}
       </main>
+
+      {/* Input Area */}
+      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-zinc-50 via-zinc-50 to-transparent pt-10 pb-6 px-4">
+        <div className="max-w-3xl mx-auto relative">
+          <form 
+            onSubmit={sendMessage}
+            className="flex items-center bg-white border border-zinc-300 rounded-full shadow-sm pr-2 pl-4 py-2 focus-within:ring-2 focus-within:ring-blue-500/20 focus-within:border-blue-500 transition-all"
+          >
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileUpload}
+              className="hidden"
+              accept=".pdf,.txt,text/plain,application/pdf"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading || isLoading}
+              className="p-2 text-zinc-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-colors disabled:opacity-50 flex-shrink-0"
+              title="Attach document (PDF/TXT)"
+            >
+              <Paperclip className="w-5 h-5" />
+            </button>
+            
+            <input
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              placeholder="Message Ragasiyam..."
+              disabled={isLoading || isUploading}
+              className="flex-1 bg-transparent border-none focus:outline-none px-3 text-[15px] placeholder-zinc-400 disabled:opacity-50"
+            />
+            
+            <button
+              type="submit"
+              disabled={!inputText.trim() || isLoading || isUploading}
+              className={`p-2 rounded-full flex items-center justify-center transition-colors ml-1 ${
+                inputText.trim() && !isLoading && !isUploading
+                  ? "bg-blue-600 text-white hover:bg-blue-700 shadow-sm"
+                  : "bg-zinc-100 text-zinc-400"
+              }`}
+            >
+              <Send className="w-4 h-4 ml-0.5" />
+            </button>
+          </form>
+          <div className="text-center mt-3 text-xs text-zinc-400">
+            Ragasiyam can make mistakes. Consider verifying critical information.
+          </div>
+        </div>
+      </div>
+      
     </div>
   );
 }
