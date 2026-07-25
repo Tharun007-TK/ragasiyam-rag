@@ -1,15 +1,16 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, ReactNode } from "react";
 import {
   Send, Paperclip, Bot, LogOut, Menu, X, Plus,
   Image as ImageIcon, Search, SlidersHorizontal,
-  MoreHorizontal, PenSquare,
+  MoreHorizontal, PenSquare, ChevronDown, Mic,
 } from "lucide-react";
 import { useSession, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
+// ── Types ──────────────────────────────────────────────────────────────────────
 type Message = {
   role: "user" | "assistant";
   content: string;
@@ -24,12 +25,132 @@ type Session = {
   message_count: number;
 };
 
+// ── Markdown renderer ──────────────────────────────────────────────────────────
+function InlineText({ text }: { text: string }): ReactNode {
+  const parts: ReactNode[] = [];
+  const regex = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(<span key={key++}>{text.slice(lastIndex, match.index)}</span>);
+    }
+    const m = match[0];
+    if (m.startsWith("**")) {
+      parts.push(<strong key={key++} className="font-semibold text-[#1a1a18]">{m.slice(2, -2)}</strong>);
+    } else if (m.startsWith("`")) {
+      parts.push(
+        <code key={key++} className="bg-zinc-100 text-[#c2410c] px-1.5 py-0.5 rounded text-[0.83em] font-mono border border-zinc-200">
+          {m.slice(1, -1)}
+        </code>
+      );
+    } else if (m.startsWith("*")) {
+      parts.push(<em key={key++}>{m.slice(1, -1)}</em>);
+    }
+    lastIndex = match.index + m.length;
+  }
+  if (lastIndex < text.length) parts.push(<span key={key++}>{text.slice(lastIndex)}</span>);
+  return parts.length > 0 ? <>{parts}</> : <>{text}</>;
+}
+
+function MarkdownRenderer({ content }: { content: string }) {
+  const lines = content.split("\n");
+  const elements: ReactNode[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    if (line.startsWith("```")) {
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      elements.push(
+        <pre key={`code-${i}`} className="bg-[#f7f6f3] border border-[#e5e3df] rounded-xl px-4 py-3.5 overflow-x-auto my-3 text-[13px]">
+          <code className="font-mono text-[#374151] leading-relaxed">{codeLines.join("\n")}</code>
+        </pre>
+      );
+      i++;
+      continue;
+    }
+
+    // Headings
+    if (line.startsWith("### ")) {
+      elements.push(<h3 key={i} className="font-semibold text-[#1a1a18] mt-4 mb-1 text-[15px]"><InlineText text={line.slice(4)} /></h3>);
+    } else if (line.startsWith("## ")) {
+      elements.push(<h2 key={i} className="font-bold text-[#1a1a18] mt-5 mb-2 text-[17px]"><InlineText text={line.slice(3)} /></h2>);
+    } else if (line.startsWith("# ")) {
+      elements.push(<h1 key={i} className="font-bold text-[#1a1a18] mt-5 mb-2 text-[19px]"><InlineText text={line.slice(2)} /></h1>);
+    }
+    // Horizontal rule
+    else if (line.match(/^-{3,}$/)) {
+      elements.push(<hr key={i} className="border-[#e5e3df] my-4" />);
+    }
+    // Bullet list — consume consecutive lines
+    else if (line.match(/^[-*] /)) {
+      const items: string[] = [];
+      while (i < lines.length && lines[i].match(/^[-*] /)) {
+        items.push(lines[i].slice(2));
+        i++;
+      }
+      elements.push(
+        <ul key={`ul-${i}`} className="list-disc pl-5 my-2 space-y-1">
+          {items.map((item, j) => (
+            <li key={j} className="text-[#3d3b38] leading-relaxed"><InlineText text={item} /></li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+    // Ordered list
+    else if (line.match(/^\d+\. /)) {
+      const items: string[] = [];
+      while (i < lines.length && lines[i].match(/^\d+\. /)) {
+        items.push(lines[i].replace(/^\d+\.\s/, ""));
+        i++;
+      }
+      elements.push(
+        <ol key={`ol-${i}`} className="list-decimal pl-5 my-2 space-y-1">
+          {items.map((item, j) => (
+            <li key={j} className="text-[#3d3b38] leading-relaxed"><InlineText text={item} /></li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+    // Empty line
+    else if (line.trim() === "") {
+      elements.push(<div key={i} className="h-3" />);
+    }
+    // Regular text
+    else {
+      elements.push(
+        <p key={i} className="text-[#3d3b38] leading-[1.7] my-0.5">
+          <InlineText text={line} />
+        </p>
+      );
+    }
+
+    i++;
+  }
+
+  return <div className="text-[15px]">{elements}</div>;
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
 function generateSessionId(): string {
   return typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : Math.random().toString(36).substring(2) + Date.now().toString(36);
 }
 
+// ── Main Component ─────────────────────────────────────────────────────────────
 export default function ChatPage() {
   const { data: session, status } = useSession();
   const router = useRouter();
@@ -40,35 +161,32 @@ export default function ChatPage() {
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [guestSessionId, setGuestSessionId] = useState<string>("");
   const [guestMessageCount, setGuestMessageCount] = useState(0);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [hoveredSession, setHoveredSession] = useState<string | null>(null);
 
-  // Image state
+  // Image
   const [pendingImage, setPendingImage] = useState<File | null>(null);
   const [pendingImagePreview, setPendingImagePreview] = useState<string>("");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const API_BASE = "/api/py";
   const GUEST_LIMIT = 3;
 
-  // ── Init guest session ──────────────────────────────────────────
+  // ── Guest session init ────────────────────────────────────────────
   useEffect(() => {
-    let storedSession = localStorage.getItem("guest_session_id");
-    if (!storedSession) {
-      storedSession = Math.random().toString(36).substring(2, 15);
-      localStorage.setItem("guest_session_id", storedSession);
-    }
-    setGuestSessionId(storedSession);
-    const count = parseInt(localStorage.getItem(`guest_count_${storedSession}`) || "0");
-    setGuestMessageCount(count);
+    let s = localStorage.getItem("guest_session_id");
+    if (!s) { s = Math.random().toString(36).substring(2, 15); localStorage.setItem("guest_session_id", s); }
+    setGuestSessionId(s);
+    setGuestMessageCount(parseInt(localStorage.getItem(`guest_count_${s}`) || "0"));
   }, []);
 
   useEffect(() => {
@@ -76,34 +194,30 @@ export default function ChatPage() {
   }, []);
 
   const getHeaders = useCallback((): Record<string, string> => {
-    if (status === "authenticated" && (session as any)?.accessToken) {
+    if (status === "authenticated" && (session as any)?.accessToken)
       return { Authorization: `Bearer ${(session as any).accessToken}` };
-    }
     return { "X-Session-ID": guestSessionId };
   }, [status, session, guestSessionId]);
 
   const updateGuestCount = () => {
     if (status === "unauthenticated") {
-      const newCount = guestMessageCount + 1;
-      setGuestMessageCount(newCount);
-      localStorage.setItem(`guest_count_${guestSessionId}`, newCount.toString());
-      return newCount;
+      const n = guestMessageCount + 1;
+      setGuestMessageCount(n);
+      localStorage.setItem(`guest_count_${guestSessionId}`, n.toString());
+      return n;
     }
     return guestMessageCount;
   };
 
-  // ── Fetch sessions list ─────────────────────────────────────────
+  // ── Sessions ──────────────────────────────────────────────────────
   const fetchSessions = useCallback(async () => {
     if (status === "loading" || (!guestSessionId && status === "unauthenticated")) return;
     setSessionsLoading(true);
     try {
       const res = await fetch(`${API_BASE}/sessions`, { headers: getHeaders() });
       if (res.ok) setSessions(await res.json());
-    } catch (err) {
-      console.error("Failed to fetch sessions", err);
-    } finally {
-      setSessionsLoading(false);
-    }
+    } catch (e) { console.error(e); }
+    finally { setSessionsLoading(false); }
   }, [status, guestSessionId, getHeaders]);
 
   const loadSession = useCallback(async (sessionId: string) => {
@@ -111,18 +225,13 @@ export default function ChatPage() {
     setMessages([]);
     clearPendingImage();
     try {
-      const res = await fetch(
-        `${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`,
-        { headers: getHeaders() }
-      );
+      const res = await fetch(`${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`, { headers: getHeaders() });
       if (res.ok) {
         const data: Message[] = await res.json();
         setMessages(data || []);
         setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
       }
-    } catch (err) {
-      console.error("Failed to load session", err);
-    }
+    } catch (e) { console.error(e); }
     setMobileMenuOpen(false);
   }, [getHeaders]);
 
@@ -142,7 +251,15 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // ── Image helpers ───────────────────────────────────────────────
+  // Auto-grow textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + "px";
+    }
+  }, [inputText]);
+
+  // ── Image ─────────────────────────────────────────────────────────
   const clearPendingImage = () => {
     setPendingImage(null);
     setPendingImagePreview("");
@@ -153,40 +270,27 @@ export default function ChatPage() {
     const file = e.target.files?.[0];
     if (!file) return;
     if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.type)) {
-      alert("Only JPEG, PNG, WebP, and GIF images are supported.");
-      return;
+      alert("Only JPEG, PNG, WebP, and GIF images are supported."); return;
     }
-    if (file.size > 10 * 1024 * 1024) {
-      alert("Image must be smaller than 10 MB.");
-      return;
-    }
+    if (file.size > 10 * 1024 * 1024) { alert("Image must be smaller than 10 MB."); return; }
     setPendingImage(file);
     const reader = new FileReader();
     reader.onload = (ev) => setPendingImagePreview(ev.target?.result as string);
     reader.readAsDataURL(file);
   };
 
-  // ── Send message ────────────────────────────────────────────────
-  const sendMessage = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    const textToSend = inputText;
-    if ((!textToSend.trim() && !pendingImage) || isLoading) return;
+  // ── Send ──────────────────────────────────────────────────────────
+  const sendMessage = async () => {
+    const textToSend = inputText.trim();
+    if ((!textToSend && !pendingImage) || isLoading) return;
 
     if (status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT) {
-      alert("You have reached your free guest limit. Please log in or sign up to continue.");
-      router.push("/signup");
-      return;
+      router.push("/signup"); return;
     }
 
-    const imageSnap = pendingImage;
-    const imagePreviewSnap = pendingImagePreview;
-
-    const newUserMsg: Message = {
-      role: "user",
-      content: textToSend,
-      imagePreview: imagePreviewSnap || undefined,
-    };
-    setMessages((prev) => [...prev, newUserMsg]);
+    const imgSnap = pendingImage;
+    const previewSnap = pendingImagePreview;
+    setMessages((p) => [...p, { role: "user", content: textToSend, imagePreview: previewSnap || undefined }]);
     setInputText("");
     clearPendingImage();
     setIsLoading(true);
@@ -195,20 +299,13 @@ export default function ChatPage() {
     try {
       let data: { reply: string; grounded: boolean };
 
-      if (imageSnap) {
-        const formData = new FormData();
-        formData.append("image", imageSnap);
-        formData.append("message", textToSend || "Describe this image.");
-        formData.append("session_id", currentSessionId);
-        const res = await fetch(`${API_BASE}/chat/vision`, {
-          method: "POST",
-          headers: getHeaders(),
-          body: formData,
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || "Vision request failed");
-        }
+      if (imgSnap) {
+        const fd = new FormData();
+        fd.append("image", imgSnap);
+        fd.append("message", textToSend || "Describe this image.");
+        fd.append("session_id", currentSessionId);
+        const res = await fetch(`${API_BASE}/chat/vision`, { method: "POST", headers: getHeaders(), body: fd });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Vision failed");
         data = await res.json();
       } else {
         const res = await fetch(`${API_BASE}/chat`, {
@@ -216,146 +313,112 @@ export default function ChatPage() {
           headers: { "Content-Type": "application/json", ...getHeaders() },
           body: JSON.stringify({ message: textToSend, session_id: currentSessionId }),
         });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || "Failed to send message");
-        }
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Request failed");
         data = await res.json();
       }
 
-      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+      setMessages((p) => [...p, { role: "assistant", content: data.reply }]);
       setTimeout(() => fetchSessions(), 500);
-    } catch (error: any) {
-      console.error(error);
-      setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${error.message}` }]);
+    } catch (err: any) {
+      setMessages((p) => [...p, { role: "assistant", content: `Error: ${err.message}` }]);
     }
     setIsLoading(false);
   };
 
-  // ── File (PDF/TXT) upload ───────────────────────────────────────
+  // ── File upload ───────────────────────────────────────────────────
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setIsUploading(true);
-    const formData = new FormData();
-    formData.append("file", file);
+    const fd = new FormData();
+    fd.append("file", file);
     try {
-      const res = await fetch(`${API_BASE}/upload`, {
-        method: "POST",
-        headers: getHeaders(),
-        body: formData,
-      });
+      const res = await fetch(`${API_BASE}/upload`, { method: "POST", headers: getHeaders(), body: fd });
       if (res.ok) {
-        const data = await res.json();
-        const docId = data.doc_id;
+        const { doc_id } = await res.json();
         if (fileInputRef.current) fileInputRef.current.value = "";
-        const pollStatus = setInterval(async () => {
+        const poll = setInterval(async () => {
           try {
-            const statusRes = await fetch(`${API_BASE}/upload/status/${docId}`, { headers: getHeaders() });
-            if (statusRes.ok) {
-              const statusData = await statusRes.json();
-              if (statusData.status === "ready") {
-                clearInterval(pollStatus);
-                setIsUploading(false);
-                setMessages((prev) => [
-                  ...prev,
-                  { role: "assistant", content: `Successfully ingested document: ${file.name}` },
-                ]);
-              } else if (statusData.status === "failed") {
-                clearInterval(pollStatus);
-                setIsUploading(false);
-                alert("Failed to process document");
-              }
+            const s = await fetch(`${API_BASE}/upload/status/${doc_id}`, { headers: getHeaders() });
+            if (s.ok) {
+              const { status: st } = await s.json();
+              if (st === "ready") {
+                clearInterval(poll); setIsUploading(false);
+                setMessages((p) => [...p, { role: "assistant", content: `Document ingested: **${file.name}**` }]);
+              } else if (st === "failed") { clearInterval(poll); setIsUploading(false); alert("Failed to process document"); }
             }
-          } catch (e) {
-            clearInterval(pollStatus);
-            setIsUploading(false);
-          }
+          } catch { clearInterval(poll); setIsUploading(false); }
         }, 2000);
-        return;
+      } else {
+        throw new Error((await res.json()).detail || "Upload failed");
       }
-      const err = await res.json();
-      throw new Error(err.detail || "Upload failed");
-    } catch (error: any) {
-      alert(error.message || "Failed to upload document");
-      setIsUploading(false);
+    } catch (err: any) {
+      alert(err.message || "Upload failed"); setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
   if (status === "loading") {
-    return (
-      <div className="flex h-screen w-full items-center justify-center bg-[#0f0f11]">
-        <div className="animate-pulse text-zinc-600">Loading...</div>
-      </div>
-    );
+    return <div className="flex h-screen items-center justify-center bg-white"><div className="text-zinc-400 text-sm animate-pulse">Loading…</div></div>;
   }
 
   const isGuestLimitReached = status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT;
-  const displayName = session?.user?.name
-    ? session.user.name.split(" ")[0]
-    : status === "unauthenticated" ? "Guest" : "Tharun";
+  const currentTitle = sessions.find((s) => s.session_id === currentSessionId)?.title;
+  const displayName = session?.user?.name?.split(" ")[0] || (status === "unauthenticated" ? "Guest" : "You");
+  const userInitials = session?.user?.name
+    ? session.user.name.split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()
+    : "G";
 
-  // Sidebar content (shared between desktop and mobile drawer)
-  const SidebarContent = () => (
-    <div className="flex flex-col h-full">
-
-      {/* ── Header ── */}
-      <div className="flex items-center justify-between px-4 pt-5 pb-3">
-        <span className="text-[17px] font-semibold tracking-tight">
-            <span className="text-indigo-400 font-bold">RAG</span>
-            <span className="text-white">'asiam</span>
-          </span>
-        <div className="flex items-center gap-1">
-          <button className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors" title="Search">
+  // ── Sidebar content ───────────────────────────────────────────────
+  const Sidebar = () => (
+    <div className="flex flex-col h-full bg-[#f5f3ef]">
+      {/* Brand header */}
+      <div className="flex items-center justify-between px-4 pt-5 pb-2">
+        <span className="text-[17px] font-bold tracking-tight">
+          <span className="text-indigo-600">RAG</span><span className="text-[#1a1a18]">'asiam</span>
+        </span>
+        <div className="flex items-center gap-0.5">
+          <button className="p-1.5 rounded-lg text-[#6b6965] hover:text-[#1a1a18] hover:bg-[#ebe8e3] transition-colors" title="Search">
             <Search className="w-4 h-4" />
           </button>
-          <button
-            onClick={startNewChat}
-            className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
-            title="New chat"
-          >
+          <button onClick={startNewChat} className="p-1.5 rounded-lg text-[#6b6965] hover:text-[#1a1a18] hover:bg-[#ebe8e3] transition-colors" title="New chat">
             <PenSquare className="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      {/* ── New Chat button ── */}
+      {/* New chat */}
       <div className="px-3 pb-3">
         <button
           onClick={startNewChat}
-          className="flex items-center gap-2.5 w-full px-3 py-2 rounded-xl bg-zinc-800/60 hover:bg-zinc-800 text-zinc-300 hover:text-white transition-colors text-sm font-medium border border-zinc-700/40"
+          className="flex items-center gap-2 w-full px-3 py-2 rounded-xl text-[#4a4845] hover:bg-[#ebe8e3] transition-colors text-[13.5px] font-medium border border-[#e0ddd8]"
         >
-          <Plus className="w-4 h-4" />
+          <Plus className="w-3.5 h-3.5" />
           New chat
         </button>
       </div>
 
-      {/* ── Recents Section ── */}
-      <div className="flex items-center justify-between px-4 pt-1 pb-2">
-        <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Recents</span>
-        <button className="p-1 rounded text-zinc-600 hover:text-zinc-400 transition-colors" title="Filter">
-          <SlidersHorizontal className="w-3.5 h-3.5" />
+      {/* Recents */}
+      <div className="flex items-center justify-between px-4 py-1.5">
+        <span className="text-[11px] font-semibold text-[#9a9591] uppercase tracking-wider">Recents</span>
+        <button className="p-0.5 rounded text-[#b5b2ae] hover:text-[#6b6965] transition-colors">
+          <SlidersHorizontal className="w-3 h-3" />
         </button>
       </div>
 
-      {/* ── Conversation List ── */}
-      <div className="flex-1 overflow-y-auto px-2 pb-2 no-scrollbar">
+      {/* Conversation list */}
+      <div className="flex-1 overflow-y-auto px-2 pb-2" style={{ scrollbarWidth: "thin", scrollbarColor: "#d4d0cb transparent" }}>
         {sessionsLoading ? (
-          <div className="flex flex-col gap-1 px-2 py-1">
-            {[1, 2, 3, 4, 5].map((i) => (
-              <div key={i} className="h-8 rounded-lg bg-zinc-800/60 animate-pulse" style={{ opacity: 1 - i * 0.15 }} />
+          <div className="px-2 pt-1 space-y-1">
+            {[1, 2, 3, 4, 5].map((n) => (
+              <div key={n} className="h-8 rounded-lg bg-[#ebe8e3] animate-pulse" style={{ opacity: 1 - n * 0.12 }} />
             ))}
           </div>
         ) : sessions.length === 0 ? (
-          <p className="text-xs text-zinc-600 px-3 py-4 text-center">
-            No conversations yet.<br />
-            <span className="text-zinc-700">Start chatting to see history here.</span>
-          </p>
+          <p className="text-[12px] text-[#9a9591] text-center py-6">No conversations yet</p>
         ) : (
           sessions.map((s) => {
             const isActive = s.session_id === currentSessionId;
-            const isHovered = hoveredSession === s.session_id;
             return (
               <div
                 key={s.session_id}
@@ -365,20 +428,16 @@ export default function ChatPage() {
               >
                 <button
                   onClick={() => loadSession(s.session_id)}
-                  className={`w-full text-left px-3 py-2 rounded-xl transition-colors text-sm leading-snug ${
+                  className={`w-full text-left px-3 py-2 rounded-lg text-[13.5px] leading-snug transition-colors ${
                     isActive
-                      ? "bg-zinc-800 text-white font-semibold"
-                      : "text-zinc-300 hover:bg-zinc-800/60 hover:text-white font-normal"
+                      ? "bg-[#ebe8e3] text-[#1a1a18] font-medium"
+                      : "text-[#4a4845] hover:bg-[#eee9e2] hover:text-[#1a1a18]"
                   }`}
                 >
-                  <span className="block truncate pr-5">
-                    {s.title}
-                  </span>
+                  <span className="block truncate pr-5">{s.title}</span>
                 </button>
-
-                {/* Three-dot menu on hover/active */}
-                {(isHovered || isActive) && (
-                  <button className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700 transition-colors opacity-0 group-hover:opacity-100">
+                {(hoveredSession === s.session_id || isActive) && (
+                  <button className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded text-[#9a9591] hover:text-[#4a4845] opacity-0 group-hover:opacity-100 transition-opacity">
                     <MoreHorizontal className="w-3.5 h-3.5" />
                   </button>
                 )}
@@ -388,167 +447,176 @@ export default function ChatPage() {
         )}
       </div>
 
-      {/* ── User Profile ── */}
-      <div className="mt-auto px-3 py-4 border-t border-zinc-800/60">
-        <div className="relative">
-          <button
-            onClick={() => setUserMenuOpen(!userMenuOpen)}
-            className="flex items-center gap-3 w-full px-2 py-2 rounded-xl hover:bg-zinc-800 transition-colors"
-          >
-            <div className="w-7 h-7 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-semibold shrink-0">
-              {session?.user?.name ? session.user.name.charAt(0).toUpperCase() : "G"}
-            </div>
-            <div className="flex-1 text-left min-w-0">
-              <p className="text-sm font-medium text-white truncate leading-tight">
-                {session?.user?.name || "Guest"}
-              </p>
-              {status === "authenticated" && (
-                <p className="text-[10px] text-zinc-500 truncate">
-                  {(session.user as any).username ? `@${(session.user as any).username}` : session.user?.email}
-                </p>
-              )}
-            </div>
-          </button>
+      {/* User profile */}
+      <div className="px-3 py-3 border-t border-[#e5e3df] relative">
+        <button
+          onClick={() => setUserMenuOpen(!userMenuOpen)}
+          className="flex items-center gap-2.5 w-full px-2 py-1.5 rounded-xl hover:bg-[#ebe8e3] transition-colors"
+        >
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
+            {userInitials}
+          </div>
+          <div className="flex-1 text-left min-w-0">
+            <p className="text-[13px] font-medium text-[#1a1a18] truncate leading-tight">
+              {session?.user?.name || "Guest"}
+            </p>
+            <p className="text-[11px] text-[#9a9591]">Free plan</p>
+          </div>
+        </button>
 
-          {userMenuOpen && (
-            <div className="absolute bottom-full left-0 right-0 mb-1 bg-zinc-900 border border-zinc-700/60 rounded-xl shadow-2xl py-1 z-50">
-              {status === "authenticated" ? (
+        {userMenuOpen && (
+          <div className="absolute bottom-full left-2 right-2 mb-1 bg-white border border-[#e5e3df] rounded-xl shadow-lg py-1 z-50">
+            {status === "authenticated" ? (
+              <>
+                <div className="px-3 py-2 border-b border-[#f0ede8]">
+                  <p className="text-[13px] font-medium text-[#1a1a18] truncate">{session.user.name}</p>
+                  <p className="text-[11px] text-[#9a9591] truncate">{session.user.email}</p>
+                </div>
                 <button
                   onClick={() => signOut()}
-                  className="w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-zinc-800 flex items-center gap-2 rounded-lg mx-1"
+                  className="w-full text-left px-3 py-2 text-[13px] text-red-500 hover:bg-[#fef2f2] flex items-center gap-2 rounded-lg mx-1"
                   style={{ width: "calc(100% - 8px)" }}
                 >
-                  <LogOut className="w-4 h-4" /> Log out
+                  <LogOut className="w-3.5 h-3.5" /> Log out
                 </button>
-              ) : (
-                <>
-                  <Link href="/login" className="block px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-white rounded-lg mx-1" style={{ display: "block", margin: "2px 4px" }}>Log in</Link>
-                  <Link href="/signup" className="block px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 hover:text-white rounded-lg" style={{ display: "block", margin: "2px 4px" }}>Sign up</Link>
-                </>
-              )}
-            </div>
-          )}
-        </div>
+              </>
+            ) : (
+              <>
+                <Link href="/login" className="block px-3 py-2 text-[13px] text-[#4a4845] hover:bg-[#f5f3ef]">Log in</Link>
+                <Link href="/signup" className="block px-3 py-2 text-[13px] text-[#4a4845] hover:bg-[#f5f3ef]">Sign up</Link>
+              </>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 
   return (
-    <div className="flex h-screen w-full bg-[#0f0f11] text-zinc-100 overflow-hidden font-sans">
+    <div className="flex h-screen w-full bg-white text-[#1a1a18] overflow-hidden" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
 
-      {/* ── Desktop Sidebar ── */}
-      <aside
-        className={`hidden md:flex flex-col shrink-0 border-r border-zinc-800/60 bg-[#141416] transition-all duration-200 ${
-          sidebarOpen ? "w-[260px]" : "w-0 overflow-hidden border-none"
-        }`}
-      >
-        <SidebarContent />
+      {/* Desktop sidebar */}
+      <aside className={`hidden md:block shrink-0 border-r border-[#e5e3df] overflow-hidden transition-all duration-200 ${sidebarOpen ? "w-[260px]" : "w-0"}`}>
+        <Sidebar />
       </aside>
 
-      {/* ── Mobile Sidebar Overlay ── */}
+      {/* Mobile sidebar */}
       {mobileMenuOpen && (
         <>
-          <div
-            className="fixed inset-0 bg-black/60 z-30 md:hidden backdrop-blur-sm"
-            onClick={() => setMobileMenuOpen(false)}
-          />
-          <aside className="fixed left-0 top-0 bottom-0 w-[280px] bg-[#141416] border-r border-zinc-800/60 z-40 flex flex-col md:hidden">
-            <div className="flex items-center justify-end px-4 pt-4 pb-2">
-              <button onClick={() => setMobileMenuOpen(false)} className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <div className="flex-1 overflow-hidden">
-              <SidebarContent />
-            </div>
-          </aside>
+          <div className="fixed inset-0 bg-black/30 z-30 md:hidden" onClick={() => setMobileMenuOpen(false)} />
+          <div className="fixed left-0 top-0 bottom-0 w-[270px] z-40 md:hidden border-r border-[#e5e3df] overflow-hidden">
+            <Sidebar />
+          </div>
         </>
       )}
 
-      {/* ── Main Content ── */}
-      <main className="flex-1 flex flex-col relative h-full min-w-0">
+      {/* Main area */}
+      <main className="flex-1 flex flex-col min-w-0 h-full">
 
         {/* Top bar */}
-        <header className="flex items-center px-4 py-3 border-b border-zinc-900/50 shrink-0 bg-[#0f0f11]/80 backdrop-blur-md z-10">
-          {/* Sidebar toggle (desktop) */}
-          <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            className="hidden md:flex p-2 -ml-1 mr-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
-            title="Toggle sidebar"
-          >
-            <Menu className="w-5 h-5" />
-          </button>
-          {/* Mobile hamburger */}
-          <button
-            onClick={() => setMobileMenuOpen(true)}
-            className="md:hidden p-2 -ml-1 mr-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
-          >
-            <Menu className="w-5 h-5" />
-          </button>
+        <header className="flex items-center justify-between px-4 py-2.5 border-b border-[#f0ede8] bg-white shrink-0">
+          <div className="flex items-center gap-2">
+            {/* Sidebar toggle */}
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="hidden md:flex p-1.5 rounded-lg text-[#9a9591] hover:text-[#1a1a18] hover:bg-[#f5f3ef] transition-colors"
+            >
+              <Menu className="w-4 h-4" />
+            </button>
+            <button onClick={() => setMobileMenuOpen(true)} className="md:hidden p-1.5 rounded-lg text-[#9a9591] hover:bg-[#f5f3ef]">
+              <Menu className="w-4 h-4" />
+            </button>
 
-          <span className="text-sm font-medium text-zinc-400 truncate">
-            {messages.length > 0
-              ? sessions.find(s => s.session_id === currentSessionId)?.title || "New conversation"
-              : "RAG'asiam"}
-          </span>
+            {/* Conversation title */}
+            {currentTitle ? (
+              <button className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[#f5f3ef] transition-colors max-w-[300px] md:max-w-[500px]">
+                <span className="text-[14px] font-semibold text-[#1a1a18] truncate">{currentTitle}</span>
+                <ChevronDown className="w-3.5 h-3.5 text-[#9a9591] shrink-0" />
+              </button>
+            ) : (
+              <span className="text-[14px] font-semibold text-[#1a1a18]">
+                <span className="text-indigo-600">RAG</span>'asiam
+              </span>
+            )}
+          </div>
+
+          {/* Right side actions */}
+          <div className="flex items-center gap-2">
+            {status === "unauthenticated" && (
+              <div className="flex items-center gap-1.5 px-3 py-1 bg-[#f5f3ef] rounded-full text-[12px] text-[#6b6965]">
+                Free plan
+                <Link href="/signup" className="text-indigo-600 font-medium hover:underline ml-1">Upgrade</Link>
+              </div>
+            )}
+          </div>
         </header>
 
-        {/* Subtle glow */}
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[700px] h-[700px] bg-blue-900/8 rounded-full blur-[120px] pointer-events-none" />
-
-        {/* ── Chat Area ── */}
-        <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-52 no-scrollbar relative z-10">
+        {/* Chat messages */}
+        <div className="flex-1 overflow-y-auto" style={{ scrollbarWidth: "thin", scrollbarColor: "#e5e3df transparent" }}>
           {messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center">
-              <h1 className="text-4xl md:text-[44px] font-medium tracking-tight mb-4 text-center text-white drop-shadow-sm">
-                What's the vibe, {displayName}?
-              </h1>
-              <p className="text-zinc-500 text-sm">
-                <span className="text-indigo-400 font-semibold">RAG</span>'asiam — ask anything, upload documents, or share images.
-              </p>
+            /* Empty state */
+            <div className="h-full flex flex-col items-center justify-center px-8">
+              <div className="mb-6">
+                <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center mx-auto mb-4">
+                  <Bot className="w-6 h-6 text-white" />
+                </div>
+                <h1 className="text-[28px] md:text-[34px] font-semibold text-[#1a1a18] text-center">
+                  How can I help you, {displayName}?
+                </h1>
+              </div>
+              {isGuestLimitReached && (
+                <div className="px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-[13px] text-amber-700 text-center max-w-sm">
+                  You've reached the free limit.{" "}
+                  <Link href="/signup" className="font-semibold underline">Sign up</Link> to continue.
+                </div>
+              )}
             </div>
           ) : (
-            <div className="max-w-3xl mx-auto w-full flex flex-col gap-6 pt-8">
+            <div className="max-w-[720px] mx-auto px-4 md:px-8 py-8 flex flex-col gap-6">
               {messages.map((m, idx) => (
-                <div key={idx} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                  <div className={`max-w-[85%] rounded-3xl px-5 py-3.5 ${
-                    m.role === "user" ? "bg-zinc-800 text-zinc-100" : "bg-transparent text-zinc-300"
-                  }`}>
-                    {m.role === "assistant" && (
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="w-6 h-6 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center shrink-0">
-                          <Bot className="w-3.5 h-3.5 text-white" />
-                        </div>
-                        <span className="text-xs font-medium text-zinc-500"><span className="text-indigo-400">RAG</span>'asiam Core</span>
+                <div key={idx}>
+                  {m.role === "user" ? (
+                    /* User message — right-aligned subtle bubble */
+                    <div className="flex justify-end">
+                      <div className="max-w-[75%] bg-[#f0ece6] rounded-[20px] px-4 py-3">
+                        {m.imagePreview && (
+                          <img src={m.imagePreview} alt="uploaded" className="rounded-xl max-h-56 max-w-full object-cover mb-2" />
+                        )}
+                        {m.content && (
+                          <p className="text-[15px] text-[#1a1a18] leading-relaxed whitespace-pre-wrap">{m.content}</p>
+                        )}
                       </div>
-                    )}
-                    {m.imagePreview && (
-                      <img
-                        src={m.imagePreview}
-                        alt="uploaded"
-                        className="rounded-2xl max-h-64 max-w-full object-cover mb-2 border border-zinc-700"
-                      />
-                    )}
-                    {m.content && (
-                      <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
-                    )}
-                  </div>
+                    </div>
+                  ) : (
+                    /* Assistant message — left-aligned, no bubble, markdown */
+                    <div className="flex gap-3 items-start">
+                      <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shrink-0 mt-0.5">
+                        <Bot className="w-4 h-4 text-white" />
+                      </div>
+                      <div className="flex-1 min-w-0 pt-0.5">
+                        <MarkdownRenderer content={m.content} />
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))}
+
+              {/* Typing indicator */}
               {isLoading && (
-                <div className="flex justify-start">
-                  <div className="px-5 py-3.5 flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-zinc-600 animate-bounce" />
-                    <div className="w-2 h-2 rounded-full bg-zinc-600 animate-bounce [animation-delay:0.2s]" />
-                    <div className="w-2 h-2 rounded-full bg-zinc-600 animate-bounce [animation-delay:0.4s]" />
+                <div className="flex gap-3 items-start">
+                  <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shrink-0">
+                    <Bot className="w-4 h-4 text-white" />
+                  </div>
+                  <div className="flex items-center gap-1 pt-2.5">
+                    <span className="w-2 h-2 rounded-full bg-[#c5c1bc] animate-bounce" />
+                    <span className="w-2 h-2 rounded-full bg-[#c5c1bc] animate-bounce [animation-delay:0.15s]" />
+                    <span className="w-2 h-2 rounded-full bg-[#c5c1bc] animate-bounce [animation-delay:0.3s]" />
                   </div>
                 </div>
               )}
               {isUploading && (
-                <div className="flex justify-start">
-                  <div className="px-5 py-3.5 flex items-center gap-2 text-zinc-500 text-sm">
-                    <Paperclip className="w-4 h-4 animate-pulse" /> Ingesting document...
-                  </div>
+                <div className="flex gap-3 items-center text-[13px] text-[#9a9591]">
+                  <Paperclip className="w-4 h-4 animate-pulse" /> Ingesting document…
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -556,85 +624,105 @@ export default function ChatPage() {
           )}
         </div>
 
-        {/* ── Input Area ── */}
-        <div className="absolute bottom-0 left-0 right-0 p-4 md:px-8 pb-8 bg-gradient-to-t from-[#0f0f11] via-[#0f0f11]/95 to-transparent z-20">
-          {isGuestLimitReached && (
-            <div className="max-w-3xl mx-auto mb-4 p-3 bg-indigo-950/50 border border-indigo-900/50 rounded-xl text-indigo-200 text-sm text-center">
-              You've reached your free guest limit.{" "}
-              <Link href="/signup" className="font-semibold underline hover:text-white">Sign up</Link>{" "}
-              to continue.
-            </div>
-          )}
+        {/* ── Input area ── */}
+        <div className="shrink-0 px-4 md:px-8 pb-6 pt-3 bg-white border-t border-[#f0ede8]">
+          <div className="max-w-[720px] mx-auto">
 
-          <div className="max-w-3xl mx-auto flex flex-col gap-2">
-            {/* Image preview strip */}
+            {/* Image preview */}
             {pendingImagePreview && (
-              <div className="flex items-center gap-3 px-3 py-2 bg-zinc-900/80 backdrop-blur-xl border border-zinc-800 rounded-2xl">
+              <div className="flex items-center gap-3 mb-3 p-2.5 bg-[#f5f3ef] rounded-xl border border-[#e5e3df]">
                 <div className="relative shrink-0">
-                  <img src={pendingImagePreview} alt="pending" className="h-16 w-16 rounded-xl object-cover border border-zinc-700" />
+                  <img src={pendingImagePreview} alt="pending" className="h-14 w-14 rounded-lg object-cover border border-[#e5e3df]" />
                   <button
                     onClick={clearPendingImage}
-                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-700 hover:bg-zinc-600 flex items-center justify-center transition-colors"
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-[#6b6965] hover:bg-[#4a4845] flex items-center justify-center"
                   >
                     <X className="w-3 h-3 text-white" />
                   </button>
                 </div>
                 <div className="min-w-0">
-                  <p className="text-xs font-medium text-zinc-300 truncate">{pendingImage?.name}</p>
-                  <p className="text-[10px] text-zinc-600 mt-0.5">
-                    {pendingImage ? (pendingImage.size / 1024).toFixed(0) + " KB" : ""}
-                  </p>
-                  <p className="text-[10px] text-indigo-400 mt-0.5">Ready to send with your message</p>
+                  <p className="text-[12px] font-medium text-[#4a4845] truncate">{pendingImage?.name}</p>
+                  <p className="text-[11px] text-[#9a9591]">{pendingImage ? (pendingImage.size / 1024).toFixed(0) + " KB" : ""} · Image ready</p>
                 </div>
               </div>
             )}
 
-            {/* Input pill */}
-            <div className={`bg-zinc-900/80 backdrop-blur-xl border border-zinc-800/80 rounded-full flex items-center px-2 py-2 shadow-2xl transition-all focus-within:border-zinc-700 focus-within:ring-1 focus-within:ring-zinc-700/50 ${isGuestLimitReached ? "opacity-50 pointer-events-none" : ""}`}>
-              {/* Document upload */}
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isUploading}
-                className="p-3 text-zinc-500 hover:text-blue-400 hover:bg-zinc-800 rounded-full transition-colors shrink-0 disabled:opacity-50 ml-1"
-                title="Upload PDF / TXT"
-              >
-                {isUploading
-                  ? <div className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
-                  : <Paperclip className="w-5 h-5" />}
-              </button>
-              <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".txt,.pdf" />
+            {/* Main input box */}
+            <div className={`border rounded-2xl bg-white transition-shadow ${
+              isGuestLimitReached ? "opacity-50 pointer-events-none border-[#e5e3df]" : "border-[#d4d0cb] hover:border-[#b5b2ae] focus-within:border-[#9a9591] focus-within:shadow-sm"
+            }`}>
+              {/* Textarea */}
+              <div className="px-4 pt-3.5 pb-2">
+                <textarea
+                  ref={textareaRef}
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+                  }}
+                  disabled={isLoading || isGuestLimitReached}
+                  placeholder={pendingImage ? "Ask about this image…" : "Write a message…"}
+                  rows={1}
+                  className="w-full bg-transparent text-[15px] text-[#1a1a18] placeholder:text-[#b5b2ae] resize-none focus:outline-none leading-relaxed disabled:opacity-50"
+                  style={{ minHeight: "24px", maxHeight: "200px", overflowY: "auto" }}
+                />
+              </div>
 
-              {/* Image upload */}
-              <button
-                onClick={() => imageInputRef.current?.click()}
-                disabled={isLoading}
-                className={`p-3 rounded-full transition-colors shrink-0 disabled:opacity-50 ${pendingImage ? "text-purple-400 bg-purple-500/10" : "text-zinc-500 hover:text-purple-400 hover:bg-zinc-800"}`}
-                title="Send an image"
-              >
-                <ImageIcon className="w-5 h-5" />
-              </button>
-              <input type="file" ref={imageInputRef} onChange={handleImageSelect} className="hidden" accept="image/jpeg,image/png,image/webp,image/gif" />
+              {/* Toolbar */}
+              <div className="flex items-center justify-between px-3 pb-3">
+                <div className="flex items-center gap-1">
+                  {/* Attach document */}
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isUploading}
+                    className="p-2 rounded-lg text-[#9a9591] hover:text-[#4a4845] hover:bg-[#f5f3ef] transition-colors disabled:opacity-40"
+                    title="Upload PDF / TXT"
+                  >
+                    {isUploading
+                      ? <div className="w-4 h-4 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" />
+                      : <Plus className="w-4 h-4" />}
+                  </button>
+                  <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".txt,.pdf" />
 
-              <input
-                type="text"
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-                }}
-                disabled={isLoading}
-                placeholder={pendingImage ? "Ask about this image…" : "Ask Gemini"}
-                className="flex-1 bg-transparent border-none text-white px-3 py-3 focus:outline-none focus:ring-0 placeholder:text-zinc-500 text-[15px] min-w-0"
-              />
+                  {/* Attach image */}
+                  <button
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={isLoading}
+                    className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${pendingImage ? "text-indigo-600 bg-indigo-50" : "text-[#9a9591] hover:text-[#4a4845] hover:bg-[#f5f3ef]"}`}
+                    title="Send an image"
+                  >
+                    <ImageIcon className="w-4 h-4" />
+                  </button>
+                  <input type="file" ref={imageInputRef} onChange={handleImageSelect} className="hidden" accept="image/jpeg,image/png,image/webp,image/gif" />
+                </div>
 
-              <button
-                onClick={() => sendMessage()}
-                disabled={(!inputText.trim() && !pendingImage) || isLoading}
-                className="p-3 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-full transition-colors disabled:opacity-30 mr-1"
-              >
-                <Send className="w-5 h-5" />
-              </button>
+                <div className="flex items-center gap-2">
+                  {/* Model label */}
+                  <button className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] text-[#6b6965] hover:bg-[#f5f3ef] transition-colors font-medium">
+                    <span className="text-indigo-600 font-semibold text-[11px]">RAG</span>'asiam Pro
+                    <ChevronDown className="w-3 h-3 text-[#b5b2ae]" />
+                  </button>
+
+                  {/* Mic */}
+                  <button className="p-2 rounded-lg text-[#9a9591] hover:text-[#4a4845] hover:bg-[#f5f3ef] transition-colors">
+                    <Mic className="w-4 h-4" />
+                  </button>
+
+                  {/* Send */}
+                  <button
+                    onClick={sendMessage}
+                    disabled={(!inputText.trim() && !pendingImage) || isLoading || isGuestLimitReached}
+                    className="p-2 rounded-lg bg-[#1a1a18] text-white hover:bg-[#2d2d2b] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
             </div>
+
+            <p className="text-center text-[11px] text-[#b5b2ae] mt-2">
+              RAG'asiam can make mistakes. Always verify important information.
+            </p>
           </div>
         </div>
       </main>
