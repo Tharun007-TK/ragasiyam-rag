@@ -1,7 +1,10 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Send, Paperclip, Bot, LogOut, ChevronUp, ChevronDown, Menu, X, Plus, MessageSquare } from "lucide-react";
+import {
+  Send, Paperclip, Bot, LogOut, ChevronUp, ChevronDown,
+  Menu, X, Plus, MessageSquare, Image as ImageIcon,
+} from "lucide-react";
 import { useSession, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -10,6 +13,7 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   timestamp?: string;
+  imagePreview?: string; // base64 data-URL shown in the bubble
 };
 
 type Session = {
@@ -41,8 +45,13 @@ export default function ChatPage() {
   const [guestMessageCount, setGuestMessageCount] = useState(0);
   const [sessionsLoading, setSessionsLoading] = useState(false);
 
+  // Image state
+  const [pendingImage, setPendingImage] = useState<File | null>(null);
+  const [pendingImagePreview, setPendingImagePreview] = useState<string>("");
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const API_BASE = "/api/py";
   const GUEST_LIMIT = 3;
@@ -55,16 +64,12 @@ export default function ChatPage() {
       localStorage.setItem("guest_session_id", storedSession);
     }
     setGuestSessionId(storedSession);
-
     const count = parseInt(localStorage.getItem(`guest_count_${storedSession}`) || "0");
     setGuestMessageCount(count);
   }, []);
 
-  // ── Start fresh session on mount ────────────────────────────────
   useEffect(() => {
-    if (!currentSessionId) {
-      setCurrentSessionId(generateSessionId());
-    }
+    if (!currentSessionId) setCurrentSessionId(generateSessionId());
   }, []);
 
   const getHeaders = useCallback((): Record<string, string> => {
@@ -90,10 +95,7 @@ export default function ChatPage() {
     setSessionsLoading(true);
     try {
       const res = await fetch(`${API_BASE}/sessions`, { headers: getHeaders() });
-      if (res.ok) {
-        const data: Session[] = await res.json();
-        setSessions(data);
-      }
+      if (res.ok) setSessions(await res.json());
     } catch (err) {
       console.error("Failed to fetch sessions", err);
     } finally {
@@ -101,14 +103,15 @@ export default function ChatPage() {
     }
   }, [status, guestSessionId, getHeaders]);
 
-  // ── Load messages for a specific session ────────────────────────
   const loadSession = useCallback(async (sessionId: string) => {
     setCurrentSessionId(sessionId);
     setMessages([]);
+    clearPendingImage();
     try {
-      const res = await fetch(`${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`, {
-        headers: getHeaders(),
-      });
+      const res = await fetch(
+        `${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`,
+        { headers: getHeaders() }
+      );
       if (res.ok) {
         const data: Message[] = await res.json();
         setMessages(data || []);
@@ -120,18 +123,15 @@ export default function ChatPage() {
     setSidebarOpen(false);
   }, [getHeaders]);
 
-  // Start a brand new conversation
   const startNewChat = useCallback(() => {
     setCurrentSessionId(generateSessionId());
     setMessages([]);
+    clearPendingImage();
     setSidebarOpen(false);
   }, []);
 
-  // Load sessions when auth state is ready
   useEffect(() => {
-    if (status !== "loading") {
-      fetchSessions();
-    }
+    if (status !== "loading") fetchSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, guestSessionId]);
 
@@ -139,11 +139,35 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // ── Send message ────────────────────────────────────────────────
+  // ── Image helpers ───────────────────────────────────────────────
+  const clearPendingImage = () => {
+    setPendingImage(null);
+    setPendingImagePreview("");
+    if (imageInputRef.current) imageInputRef.current.value = "";
+  };
+
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.type)) {
+      alert("Only JPEG, PNG, WebP, and GIF images are supported.");
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      alert("Image must be smaller than 10 MB.");
+      return;
+    }
+    setPendingImage(file);
+    const reader = new FileReader();
+    reader.onload = (ev) => setPendingImagePreview(ev.target?.result as string);
+    reader.readAsDataURL(file);
+  };
+
+  // ── Send message (text or text+image) ──────────────────────────
   const sendMessage = async (e?: React.FormEvent, textOverride?: string) => {
     e?.preventDefault();
     const textToSend = textOverride || inputText;
-    if (!textToSend.trim() || isLoading) return;
+    if ((!textToSend.trim() && !pendingImage) || isLoading) return;
 
     if (status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT) {
       alert("You have reached your free guest limit. Please log in or sign up to continue.");
@@ -151,31 +175,56 @@ export default function ChatPage() {
       return;
     }
 
-    const newUserMsg: Message = { role: "user", content: textToSend };
+    const imageSnap = pendingImage;
+    const imagePreviewSnap = pendingImagePreview;
+
+    // Optimistic update
+    const newUserMsg: Message = {
+      role: "user",
+      content: textToSend,
+      imagePreview: imagePreviewSnap || undefined,
+    };
     setMessages((prev) => [...prev, newUserMsg]);
     setInputText("");
+    clearPendingImage();
     setIsLoading(true);
     updateGuestCount();
 
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...getHeaders(),
-        },
-        body: JSON.stringify({ message: textToSend, session_id: currentSessionId }),
-      });
+      let data: { reply: string; grounded: boolean };
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || "Failed to send message");
+      if (imageSnap) {
+        // ── Vision path ──────────────────────────────────────────
+        const formData = new FormData();
+        formData.append("image", imageSnap);
+        formData.append("message", textToSend || "Describe this image.");
+        formData.append("session_id", currentSessionId);
+
+        const res = await fetch(`${API_BASE}/chat/vision`, {
+          method: "POST",
+          headers: getHeaders(),
+          body: formData,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || "Vision request failed");
+        }
+        data = await res.json();
+      } else {
+        // ── Text / RAG path ──────────────────────────────────────
+        const res = await fetch(`${API_BASE}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getHeaders() },
+          body: JSON.stringify({ message: textToSend, session_id: currentSessionId }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || "Failed to send message");
+        }
+        data = await res.json();
       }
 
-      const data = await res.json();
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
-
-      // Refresh sidebar sessions (debounced — only when we actually sent)
       setTimeout(() => fetchSessions(), 500);
     } catch (error: any) {
       console.error(error);
@@ -184,7 +233,7 @@ export default function ChatPage() {
     setIsLoading(false);
   };
 
-  // ── File upload ─────────────────────────────────────────────────
+  // ── File (PDF/TXT) upload ───────────────────────────────────────
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -219,7 +268,10 @@ export default function ChatPage() {
                 clearInterval(pollStatus);
                 setIsUploading(false);
                 updateGuestCount();
-                setMessages((prev) => [...prev, { role: "assistant", content: `Successfully ingested document: ${file.name}` }]);
+                setMessages((prev) => [
+                  ...prev,
+                  { role: "assistant", content: `Successfully ingested document: ${file.name}` },
+                ]);
               } else if (statusData.status === "failed") {
                 clearInterval(pollStatus);
                 setIsUploading(false);
@@ -232,7 +284,6 @@ export default function ChatPage() {
             setIsUploading(false);
           }
         }, 2000);
-
         return;
       } else {
         const err = await res.json();
@@ -255,14 +306,12 @@ export default function ChatPage() {
   }
 
   const isGuestLimitReached = status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT;
-
   const displayName = session?.user?.name
     ? session.user.name.split(" ")[0]
     : status === "unauthenticated"
     ? "Guest"
     : "Tharun";
 
-  // Format relative time for sidebar
   const relativeTime = (iso: string) => {
     const diff = Date.now() - new Date(iso).getTime();
     const mins = Math.floor(diff / 60000);
@@ -286,8 +335,6 @@ export default function ChatPage() {
 
       {/* Sidebar */}
       <aside className={`absolute md:static transition-all duration-300 ease-in-out border-r border-zinc-900 bg-zinc-950 flex flex-col items-center py-6 h-full z-30 ${sidebarOpen ? "translate-x-0 w-64 px-4" : "-translate-x-full md:translate-x-0 w-16"}`}>
-
-        {/* Top Actions */}
         <div className="flex flex-col gap-4 w-full items-center">
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -295,12 +342,9 @@ export default function ChatPage() {
           >
             <Menu className="w-5 h-5" />
           </button>
-
           <button className="md:hidden p-2 rounded-xl text-zinc-400 self-end" onClick={() => setSidebarOpen(false)}>
             <X className="w-5 h-5" />
           </button>
-
-          {/* New Chat Button */}
           <button
             onClick={startNewChat}
             className={`flex items-center gap-3 p-2 rounded-xl text-zinc-300 hover:text-white hover:bg-zinc-900 transition-colors w-full ${sidebarOpen ? "justify-start px-3" : "justify-center"}`}
@@ -311,12 +355,11 @@ export default function ChatPage() {
           </button>
         </div>
 
-        {/* History Area */}
+        {/* History */}
         <div className="flex-1 w-full overflow-y-auto mt-6 flex flex-col gap-1 no-scrollbar">
           {sidebarOpen && (
             <div className="text-xs font-semibold text-zinc-600 uppercase tracking-wider mb-2 px-2">History</div>
           )}
-
           {sidebarOpen && (
             sessionsLoading ? (
               <div className="px-2 py-4 flex flex-col gap-2">
@@ -347,17 +390,13 @@ export default function ChatPage() {
               ))
             )
           )}
-
-          {/* Collapsed state: just icons */}
           {!sidebarOpen && sessions.slice(0, 8).map((s) => (
             <button
               key={s.session_id}
               onClick={() => loadSession(s.session_id)}
               title={s.title}
               className={`flex justify-center p-2 rounded-xl transition-colors w-full ${
-                s.session_id === currentSessionId
-                  ? "bg-zinc-800 text-white"
-                  : "text-zinc-600 hover:text-white hover:bg-zinc-900"
+                s.session_id === currentSessionId ? "bg-zinc-800 text-white" : "text-zinc-600 hover:text-white hover:bg-zinc-900"
               }`}
             >
               <MessageSquare className="w-4 h-4" />
@@ -410,7 +449,7 @@ export default function ChatPage() {
         </div>
       </aside>
 
-      {/* Main Content Area */}
+      {/* Main Content */}
       <main className="flex-1 flex flex-col relative h-full min-w-0">
 
         {/* Mobile Header */}
@@ -421,11 +460,11 @@ export default function ChatPage() {
           <span className="font-semibold text-white ml-2 tracking-wide text-sm">Ragasiyam</span>
         </header>
 
-        {/* Subtle radial glow */}
+        {/* Glow */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-blue-900/10 rounded-full blur-[120px] pointer-events-none" />
 
         {/* Chat Area */}
-        <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-40 no-scrollbar relative z-10 flex flex-col">
+        <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-52 no-scrollbar relative z-10 flex flex-col">
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center -mt-20">
               <h1 className="text-4xl md:text-[44px] font-medium tracking-tight mb-12 text-center text-white drop-shadow-sm">
@@ -437,9 +476,7 @@ export default function ChatPage() {
               {messages.map((m, idx) => (
                 <div key={idx} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
                   <div className={`max-w-[85%] rounded-3xl px-5 py-3.5 ${
-                    m.role === "user"
-                      ? "bg-zinc-800 text-zinc-100"
-                      : "bg-transparent text-zinc-300"
+                    m.role === "user" ? "bg-zinc-800 text-zinc-100" : "bg-transparent text-zinc-300"
                   }`}>
                     {m.role === "assistant" && (
                       <div className="flex items-center gap-2 mb-2">
@@ -449,10 +486,21 @@ export default function ChatPage() {
                         <span className="text-xs font-medium text-zinc-500">Ragasiyam Core</span>
                       </div>
                     )}
-                    <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
+                    {/* Image preview inside user bubble */}
+                    {m.imagePreview && (
+                      <img
+                        src={m.imagePreview}
+                        alt="uploaded"
+                        className="rounded-2xl max-h-64 max-w-full object-cover mb-2 border border-zinc-700"
+                      />
+                    )}
+                    {m.content && (
+                      <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
+                    )}
                   </div>
                 </div>
               ))}
+
               {isLoading && (
                 <div className="flex justify-start">
                   <div className="bg-transparent text-zinc-500 px-5 py-3.5 flex items-center gap-2">
@@ -475,36 +523,78 @@ export default function ChatPage() {
         </div>
 
         {/* Input Area */}
-        <div className="absolute bottom-0 left-0 right-0 p-4 md:px-8 pb-8 bg-gradient-to-t from-[#0f0f11] via-[#0f0f11] to-transparent z-20">
+        <div className="absolute bottom-0 left-0 right-0 p-4 md:px-8 pb-8 bg-gradient-to-t from-[#0f0f11] via-[#0f0f11]/95 to-transparent z-20">
 
           {isGuestLimitReached && (
             <div className="max-w-3xl mx-auto mb-4 p-3 bg-indigo-950/50 border border-indigo-900/50 rounded-xl text-indigo-200 text-sm text-center backdrop-blur-md">
               You've reached your free guest limit.{" "}
               <Link href="/signup" className="font-semibold underline hover:text-white">Sign up</Link>{" "}
-              to continue chatting and uploading documents.
+              to continue chatting.
             </div>
           )}
 
-          <div className="max-w-3xl mx-auto relative">
+          <div className="max-w-3xl mx-auto flex flex-col gap-2">
+
+            {/* Image preview strip */}
+            {pendingImagePreview && (
+              <div className="flex items-center gap-3 px-3 py-2 bg-zinc-900/80 backdrop-blur-xl border border-zinc-800 rounded-2xl">
+                <div className="relative shrink-0">
+                  <img
+                    src={pendingImagePreview}
+                    alt="pending"
+                    className="h-16 w-16 rounded-xl object-cover border border-zinc-700"
+                  />
+                  <button
+                    onClick={clearPendingImage}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-700 hover:bg-zinc-600 flex items-center justify-center transition-colors"
+                  >
+                    <X className="w-3 h-3 text-white" />
+                  </button>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-zinc-300 truncate">{pendingImage?.name}</p>
+                  <p className="text-[10px] text-zinc-600 mt-0.5">
+                    {pendingImage ? (pendingImage.size / 1024).toFixed(0) + " KB" : ""}
+                  </p>
+                  <p className="text-[10px] text-indigo-400 mt-0.5">Ready to send with your message</p>
+                </div>
+              </div>
+            )}
+
+            {/* Input pill */}
             <div className={`bg-zinc-900/80 backdrop-blur-xl border border-zinc-800/80 rounded-full flex items-center px-2 py-2 shadow-2xl transition-all focus-within:border-zinc-700 focus-within:bg-zinc-900 focus-within:ring-1 focus-within:ring-zinc-700 ${isGuestLimitReached ? "opacity-50 pointer-events-none" : ""}`}>
 
+              {/* Document upload */}
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isUploading || isGuestLimitReached}
                 className="p-3 text-blue-500 hover:bg-zinc-800 rounded-full transition-colors shrink-0 disabled:opacity-50 flex items-center justify-center ml-1"
-                title="Attach a file"
+                title="Upload PDF / TXT"
               >
-                {isUploading ? <div className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" /> : <Paperclip className="w-5 h-5" />}
+                {isUploading
+                  ? <div className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                  : <Paperclip className="w-5 h-5" />}
               </button>
+              <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".txt,.pdf" />
 
+              {/* Image upload */}
+              <button
+                onClick={() => imageInputRef.current?.click()}
+                disabled={isLoading || isGuestLimitReached}
+                className={`p-3 rounded-full transition-colors shrink-0 disabled:opacity-50 flex items-center justify-center ${pendingImage ? "text-purple-400 bg-purple-500/10" : "text-zinc-400 hover:text-purple-400 hover:bg-zinc-800"}`}
+                title="Send an image (JPEG, PNG, WebP, GIF)"
+              >
+                <ImageIcon className="w-5 h-5" />
+              </button>
               <input
                 type="file"
-                ref={fileInputRef}
-                onChange={handleFileUpload}
+                ref={imageInputRef}
+                onChange={handleImageSelect}
                 className="hidden"
-                accept=".txt,.pdf"
+                accept="image/jpeg,image/png,image/webp,image/gif"
               />
 
+              {/* Text input */}
               <input
                 type="text"
                 value={inputText}
@@ -516,7 +606,7 @@ export default function ChatPage() {
                   }
                 }}
                 disabled={isLoading || isGuestLimitReached}
-                placeholder="Ask Gemini"
+                placeholder={pendingImage ? "Ask about this image…" : "Ask Gemini"}
                 className="flex-1 bg-transparent border-none text-white px-3 py-3 focus:outline-none focus:ring-0 placeholder:text-zinc-500 text-[15px] min-w-0"
               />
 
@@ -529,7 +619,7 @@ export default function ChatPage() {
 
                 <button
                   onClick={() => sendMessage()}
-                  disabled={!inputText.trim() || isLoading || isGuestLimitReached}
+                  disabled={(!inputText.trim() && !pendingImage) || isLoading || isGuestLimitReached}
                   className="p-3 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-full transition-colors disabled:opacity-30 flex items-center justify-center mr-1"
                 >
                   <Send className="w-5 h-5" />

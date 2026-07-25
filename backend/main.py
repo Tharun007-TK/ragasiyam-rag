@@ -9,6 +9,7 @@ Design notes:
 
 import os
 import uuid
+import base64
 import tempfile
 import asyncio
 import threading
@@ -432,6 +433,83 @@ async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_cu
     await save_message(user_id, "assistant", reply_text, session_id)
 
     return ChatResponse(reply=reply_text, grounded=grounded)
+
+
+# ── POST /chat/vision ─────────────────────────────────────────────────
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+@app.post("/chat/vision")
+@limiter.limit("10/minute")
+async def chat_vision(
+    request: Request,
+    message: str = Form(""),
+    session_id: str = Form(""),
+    image: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_or_session),
+):
+    """Send an image (+ optional text) to Gemini Vision and return a reply."""
+    if image.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            400,
+            f"Unsupported image type '{image.content_type}'. "
+            "Supported: JPEG, PNG, WebP, GIF."
+        )
+
+    image_bytes = await image.read()
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(400, "Image size exceeds 10 MB limit.")
+
+    user_text = message.strip() or "Describe this image."
+    print(f"[vision] user={user_id} session={session_id} file={image.filename} text={user_text[:80]!r}")
+
+    # Persist user turn (text record; image bytes are not stored in DB)
+    await save_message(user_id, "user", f"[Image] {user_text}", session_id)
+
+    # Load prior text history so Gemini has conversation context
+    history     = await load_history(user_id, session_id)
+    prior_history = history[:-1]  # exclude the turn we just saved
+
+    # Build the multimodal prompt
+    system_persona = (
+        "You are Ragasiyam Core, a smart and friendly AI assistant. "
+        "You help users with general questions AND with understanding images and documents. "
+        "Respond in a natural, conversational way."
+    )
+    image_part = {
+        "inline_data": {
+            "mime_type": image.content_type,
+            "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
+        }
+    }
+    text_part = f"{system_persona}\n\nUser: {user_text}"
+
+    # Vision uses generate_content (not chat session) because images can't
+    # be stored in chat history across turns.
+    try:
+        model   = genai.GenerativeModel(MODEL_NAME)
+        response = await asyncio.to_thread(
+            model.generate_content, [image_part, text_part]
+        )
+        reply_text = response.text
+        provider   = "gemini-vision"
+    except Exception as exc:
+        is_429 = isinstance(exc, ResourceExhausted) or "429" in str(exc)
+        if is_429 and GROQ_API_KEY:
+            # Groq doesn't support vision, so fall back to text-only description
+            print("[vision] Gemini rate-limited, falling back to Groq (text only)...")
+            client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+            groq_res = await client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": f"{system_persona}\n\n[User sent an image but vision is temporarily unavailable.] {user_text}"}],
+            )
+            reply_text = groq_res.choices[0].message.content
+            provider   = "groq-fallback"
+        else:
+            raise HTTPException(502, f"Vision error: {exc}") from exc
+
+    print(f"[INFO] Vision request served by: {provider}")
+    await save_message(user_id, "assistant", reply_text, session_id)
+    return {"reply": reply_text, "grounded": False}
 
 
 # ── GET /sessions ─────────────────────────────────────────────────
