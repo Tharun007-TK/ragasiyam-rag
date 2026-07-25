@@ -35,11 +35,14 @@ from qdrant_client.models import (
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from dotenv import load_dotenv
+import groq
+from google.api_core.exceptions import ResourceExhausted
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 MONGODB_URI    = os.getenv("MONGODB_URI")
 QDRANT_HOST    = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT    = int(os.getenv("QDRANT_PORT", "6333"))
@@ -50,7 +53,7 @@ if not MONGODB_URI:    raise RuntimeError("MONGODB_URI not set in .env")
 if not JWT_SECRET:     raise RuntimeError("JWT_SECRET not set in .env")
 
 limiter = Limiter(key_func=get_remote_address)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
@@ -86,15 +89,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid authentication token")
-        return user_id
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid authentication token")
+async def get_current_user_or_session(
+    request: Request,
+    token: str = Depends(oauth2_scheme)
+):
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            user_id = payload.get("sub")
+            if user_id:
+                return user_id
+        except jwt.PyJWTError:
+            pass # fallback to session_id if token is invalid or expired
+            
+    # Fallback to session_id (used for guests)
+    session_id = request.headers.get("X-Session-ID")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Unauthenticated: No valid JWT or X-Session-ID provided")
+    
+    # Prefix guest session IDs to avoid collision with real user IDs in the DB
+    return f"guest_{session_id}"
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -183,7 +197,7 @@ async def save_message(user_id: str, role: str, content: str):
 # ── POST /upload ──────────────────────────────────────────────────────────────
 @app.post("/upload")
 @limiter.limit("20/minute")
-async def upload(request: Request, file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
+async def upload(request: Request, file: UploadFile = File(...), user_id: str = Depends(get_current_user_or_session)):
     filename = file.filename or "document"
     
     if file.content_type not in ["application/pdf", "text/plain"]:
@@ -245,7 +259,7 @@ async def upload(request: Request, file: UploadFile = File(...), user_id: str = 
 # ── POST /chat ────────────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
-async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user)):
+async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_or_session)):
     if not req.message.strip():
         raise HTTPException(400, "message cannot be empty")
 
@@ -300,10 +314,31 @@ async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_cu
 
     try:
         response = chat_session.send_message(prompt)
+        reply_text = response.text
+        provider = "gemini"
     except Exception as exc:
-        raise HTTPException(502, f"Gemini error: {exc}") from exc
+        is_429 = isinstance(exc, ResourceExhausted) or "429" in str(exc) or "ResourceExhausted" in str(exc)
+        if is_429 and GROQ_API_KEY:
+            print("[INFO] Gemini rate limit hit (429), falling back to Groq...")
+            # Convert Gemini history format to Groq format
+            groq_messages = []
+            for m in prior_history:
+                groq_role = "assistant" if m["role"] == "model" else "user"
+                groq_messages.append({"role": groq_role, "content": m["parts"][0]})
+            groq_messages.append({"role": "user", "content": prompt})
+            
+            client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+            groq_res = await client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=groq_messages,
+            )
+            reply_text = groq_res.choices[0].message.content
+            provider = "groq"
+        else:
+            raise HTTPException(502, f"Gemini error: {exc}") from exc
 
-    reply_text = response.text
+    print(f"[INFO] Chat request successfully served by: {provider}")
+
     await save_message(user_id, "assistant", reply_text)
 
     return ChatResponse(reply=reply_text, grounded=grounded)
@@ -311,7 +346,7 @@ async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_cu
 
 # ── GET /history ─────────────────────────────────────────────────
 @app.get("/history", response_model=list[MessageOut])
-async def get_history(user_id: str = Depends(get_current_user)):
+async def get_history(user_id: str = Depends(get_current_user_or_session)):
     cursor = chats_col.find(
         {"user_id": user_id},
         {"_id": 0, "role": 1, "content": 1, "timestamp": 1},
@@ -358,7 +393,7 @@ async def health():
 # ── POST /chat/stream  (Server-Sent Events) ────────────────────────────────────────
 @app.post("/chat/stream")
 @limiter.limit("20/minute")
-async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user)):
+async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_or_session)):
     """Same RAG logic as /chat, but streams the reply via SSE chunks."""
     if not req.message.strip():
         raise HTTPException(400, "message cannot be empty")

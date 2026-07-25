@@ -13,3 +13,5 @@ qdrant-client==1.9.1
 pypdf==4.2.0
 # protobuf must stay <5 — google-generativeai 0.7.x upper bound
 protobuf>=3.19.5,<5.0.0dev
+
+groq
