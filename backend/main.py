@@ -290,6 +290,40 @@ async def save_message(user_id: str, role: str, content: str, session_id: str = 
         "timestamp":  datetime.now(timezone.utc),
     })
 
+async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assistant_msg: str):
+    """Background task to generate a title for a new session."""
+    try:
+        if not GROQ_API_KEY:
+            raise ValueError("No GROQ_API_KEY")
+        
+        prompt = (
+            "Summarize this conversation in 4-6 words as a title, no punctuation at the end, no quotes: "
+            f"User: {user_msg}\nAssistant: {assistant_msg}"
+        )
+        
+        client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+        res = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20
+            ),
+            timeout=10.0
+        )
+        title = res.choices[0].message.content.strip(' ".\'\n')
+    except Exception as e:
+        print(f"[title] Groq title generation failed: {e}")
+        title = (user_msg[:40] + "...") if len(user_msg) > 40 else user_msg
+
+    try:
+        await chats_col.update_many(
+            {"session_id": session_id, "user_id": user_id},
+            {"$set": {"title": title}}
+        )
+        print(f"[title] Generated title for {session_id}: {title}")
+    except Exception as e:
+        print(f"[title] Failed to save title for {session_id}: {e}")
+
 
 # ── POST /upload ──────────────────────────────────────────────────────────────
 async def process_upload_task(doc_id: str, filename: str, user_id: str, session_id: str, content: bytes):
@@ -423,7 +457,8 @@ async def upload_status(doc_id: str, user_id: str = Depends(get_current_user_or_
 # ── POST /chat ────────────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
-async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_or_session)):
+async def chat(request: Request, req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user_or_session)):
+    """Standard conversational endpoint with RAG context."""
     try:
         if not req.message.strip():
             raise HTTPException(400, "message cannot be empty")
@@ -556,6 +591,10 @@ async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_cu
 
         print(f"[INFO] Chat request successfully served by: {provider}")
         await save_message(user_id, "assistant", reply_text, session_id)
+        
+        if len(prior_history) == 0:
+            background_tasks.add_task(generate_chat_title, session_id, user_id, req.message, reply_text)
+
         return ChatResponse(reply=reply_text, grounded=grounded)
 
     except HTTPException:
@@ -653,8 +692,9 @@ async def get_sessions(user_id: str = Depends(get_current_user_or_session)):
         {"$sort": {"timestamp": 1}},
         {"$group": {
             "_id": "$session_id",
-            # Collect all (role, content) pairs so we can pick the first user message
+            # Collect all (role, content) pairs so we can pick the first user message fallback
             "msgs": {"$push": {"role": "$role", "content": "$content"}},
+            "title": {"$first": "$title"},
             "created_at": {"$first": "$timestamp"},
             "last_at": {"$last": "$timestamp"},
             "message_count": {"$sum": 1},
@@ -666,9 +706,11 @@ async def get_sessions(user_id: str = Depends(get_current_user_or_session)):
 
     sessions = []
     for r in results:
-        # Find the first user-role message for the title
-        first_user = next((m["content"] for m in r["msgs"] if m["role"] == "user"), None)
-        title = (first_user or "Conversation")[:60].strip()
+        # Fallback to first user message if generated title doesn't exist
+        title = r.get("title")
+        if not title:
+            first_user = next((m["content"] for m in r["msgs"] if m["role"] == "user"), None)
+            title = (first_user or "Conversation")[:60].strip()
         sessions.append(SessionOut(
             session_id=r["_id"],
             title=title,
@@ -729,7 +771,7 @@ async def health():
 # ── POST /chat/stream  (Server-Sent Events) ────────────────────────────────────────
 @app.post("/chat/stream")
 @limiter.limit("20/minute")
-async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_or_session)):
+async def chat_stream(request: Request, req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user_or_session)):
     """Same RAG logic as /chat, but streams the reply via SSE chunks."""
     try:
         if not req.message.strip():
@@ -831,6 +873,10 @@ async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends
                     elif kind == "done":
                         # Persist the complete reply now that streaming finished
                         await save_message(user_id, "assistant", full_reply, session_id)
+                        
+                        if len(prior_history) == 0:
+                            background_tasks.add_task(generate_chat_title, session_id, user_id, req.message, full_reply)
+
                         final = json.dumps({"text": "", "done": True, "grounded": grounded})
                         yield f"data: {final}\n\n"
                         break
@@ -854,4 +900,72 @@ async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends
     except Exception as e:
         import logging
         logging.exception("[chat_stream] Unhandled exception in stream endpoint")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# ── GET /sessions/search ──────────────────────────────────────────────
+@app.get("/sessions/search", response_model=list[SessionOut])
+async def search_sessions(q: str, user_id: str = Depends(get_current_user_or_session)):
+    """Search sessions by matching the query against title or message content."""
+    if not q.strip():
+        return []
+    
+    pipeline = [
+        {"$match": {"user_id": user_id, "session_id": {"$exists": True, "$ne": ""}}},
+        {"$sort": {"timestamp": 1}},
+        {"$group": {
+            "_id": "$session_id",
+            "msgs": {"$push": {"role": "$role", "content": "$content"}},
+            "title": {"$first": "$title"},
+            "created_at": {"$first": "$timestamp"},
+            "last_at": {"$last": "$timestamp"},
+            "message_count": {"$sum": 1},
+        }},
+        {"$match": {
+            "$or": [
+                {"title": {"$regex": q, "$options": "i"}},
+                {"msgs.content": {"$regex": q, "$options": "i"}}
+            ]
+        }},
+        {"$sort": {"last_at": -1}},
+        {"$limit": 50},
+    ]
+    results = await chats_col.aggregate(pipeline).to_list(50)
+
+    sessions = []
+    for r in results:
+        title = r.get("title")
+        if not title:
+            first_user = next((m["content"] for m in r["msgs"] if m["role"] == "user"), None)
+            title = (first_user or "Conversation")[:60].strip()
+        sessions.append(SessionOut(
+            session_id=r["_id"],
+            title=title,
+            created_at=r["created_at"].isoformat(),
+            message_count=r["message_count"],
+        ))
+    return sessions
+
+
+# ── DELETE /sessions/{session_id} ──────────────────────────────────────
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, user_id: str = Depends(get_current_user_or_session)):
+    """Delete a chat session and its associated vectors."""
+    try:
+        # Delete from MongoDB
+        res = await chats_col.delete_many({"session_id": session_id, "user_id": user_id})
+        
+        # Delete from Qdrant
+        await asyncio.to_thread(
+            qdrant.delete,
+            collection_name=COLLECTION_NAME,
+            points_selector=Filter(must=[
+                FieldCondition(key="session_id", match=MatchValue(value=session_id)),
+                FieldCondition(key="user_id", match=MatchValue(value=user_id))
+            ])
+        )
+        return {"status": "ok", "deleted_messages": res.deleted_count}
+    except Exception as e:
+        import logging
+        logging.exception(f"[delete] Error deleting session {session_id}")
         raise HTTPException(status_code=500, detail="Internal Server Error")

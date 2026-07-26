@@ -6,7 +6,7 @@ import {
   Search, SlidersHorizontal, MoreHorizontal, PenSquare,
   ChevronDown, Mic, Settings, Globe, HelpCircle, Zap,
   Download, Info, LogOut, Moon, Sun, Type, Shield, BookOpen,
-  Check,
+  Check, Trash2,
 } from "lucide-react";
 import { useSession, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
@@ -301,13 +301,6 @@ function SettingsModal({
                         <p style={{ fontSize: 12, color: t.textMuted }}>{session.user?.email}</p>
                       </div>
                     </div>
-                    <div className="p-4 rounded-xl" style={{ background: t.menuHover, border: `1px solid ${t.divider}` }}>
-                      <p style={{ fontSize: 12, fontWeight: 600, color: t.textMuted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Plan</p>
-                      <div className="flex items-center justify-between">
-                        <p style={{ fontSize: 14, color: t.text }}>Free plan</p>
-                        <Link href="/upgrade" className="px-3 py-1 rounded-lg text-indigo-500 hover:text-indigo-600 font-medium" style={{ fontSize: 13, background: isDark ? 'rgba(99,102,241,0.1)' : 'rgba(99,102,241,0.08)' }}>Upgrade →</Link>
-                      </div>
-                    </div>
                   </>
                 ) : (
                   <div className="flex flex-col items-center gap-4 py-6">
@@ -405,6 +398,7 @@ export default function ChatPage() {
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [messages, setMessages] = useState<Message[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
   const [currentSessionId, setCurrentSessionId] = useState("");
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -419,6 +413,7 @@ export default function ChatPage() {
   const [guestMessageCount, setGuestMessageCount] = useState(0);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [hoveredSession, setHoveredSession] = useState<string | null>(null);
+  const [sessionToDelete, setSessionToDelete] = useState<string | null>(null);
   const [pendingImage, setPendingImage] = useState<File | null>(null);
   const [pendingImagePreview, setPendingImagePreview] = useState("");
   const [pendingFile, setPendingFile] = useState<File | null>(null);
@@ -470,11 +465,12 @@ export default function ChatPage() {
     }
   };
 
-  const fetchSessions = useCallback(async () => {
+  const fetchSessions = useCallback(async (query: string = "") => {
     if (status === "loading" || (!guestSessionId && status === "unauthenticated")) return;
     setSessionsLoading(true);
     try {
-      const r = await fetch(`${API_BASE}/sessions`, { headers: getHeaders() });
+      const endpoint = query.trim() ? `/sessions/search?q=${encodeURIComponent(query)}` : `/sessions`;
+      const r = await fetch(`${API_BASE}${endpoint}`, { headers: getHeaders() });
       if (r.ok) setSessions(await r.json());
     } catch {}
     finally { setSessionsLoading(false); }
@@ -495,7 +491,31 @@ export default function ChatPage() {
     setCurrentSessionId(generateSessionId()); setMessages([]); clearPendingImage(); setMobileMenuOpen(false);
   }, []);
 
-  useEffect(() => { if (status !== "loading") fetchSessions(); }, [status, guestSessionId]);
+  const deleteSession = useCallback(async (sessionId: string) => {
+    setSessionToDelete(null);
+    
+    setSessions(prev => prev.filter(s => s.session_id !== sessionId));
+    if (currentSessionId === sessionId) {
+      startNewChat();
+    }
+    
+    try {
+      await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'DELETE',
+        headers: getHeaders()
+      });
+    } catch (err) {
+      console.error("Failed to delete session", err);
+    }
+  }, [currentSessionId, getHeaders, startNewChat]);
+
+  useEffect(() => {
+    if (status === "loading") return;
+    const delayDebounceFn = setTimeout(() => {
+      fetchSessions(searchQuery);
+    }, 300);
+    return () => clearTimeout(delayDebounceFn);
+  }, [searchQuery, status, guestSessionId, fetchSessions]);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => {
     if (textareaRef.current) {
@@ -624,10 +644,25 @@ export default function ChatPage() {
         ><Plus className="w-3.5 h-3.5" /> New chat</button>
       </div>
 
-      {/* Recents */}
-      <div className="flex items-center justify-between px-4 py-1.5">
-        <span style={{ fontSize: 11, fontWeight: 600, color: t.textFaint, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Recents</span>
-        <button style={{ color: t.textFaint }}><SlidersHorizontal className="w-3 h-3" /></button>
+      {/* Search Input */}
+      <div className="px-3 pb-2">
+        <div className="relative flex items-center">
+          <Search className="w-3.5 h-3.5 absolute left-3" style={{ color: t.placeholder }} />
+          <input
+            type="text"
+            placeholder="Search chats..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-8 pr-3 py-1.5 rounded-lg text-sm transition-colors outline-none"
+            style={{
+              background: t.inputBg,
+              color: t.text,
+              border: `1px solid ${t.inputBorder}`,
+            }}
+            onFocus={(e) => e.target.style.borderColor = t.inputBorderHover}
+            onBlur={(e) => e.target.style.borderColor = t.inputBorder}
+          />
+        </div>
       </div>
 
       {/* Session list */}
@@ -655,9 +690,13 @@ export default function ChatPage() {
                 <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 20 }}>{s.title}</span>
               </button>
               {(hoveredSession === s.session_id || isActive) && (
-                <button className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-                  style={{ color: t.textMuted }}>
-                  <MoreHorizontal className="w-3.5 h-3.5" />
+                <button 
+                  onClick={(e) => { e.stopPropagation(); setSessionToDelete(s.session_id); }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-500/10 hover:text-red-500"
+                  style={{ color: t.textMuted }}
+                  title="Delete chat"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
                 </button>
               )}
             </div>
@@ -724,7 +763,6 @@ export default function ChatPage() {
             <p style={{ fontSize: 13, fontWeight: 500, color: t.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.4 }}>
               {session?.user?.name || "Guest"}
             </p>
-            <p style={{ fontSize: 11, color: t.textMuted }}>Free plan</p>
           </div>
           <ChevronDown className="w-3.5 h-3.5 shrink-0" style={{ color: t.textFaint }} />
         </button>
@@ -793,30 +831,122 @@ export default function ChatPage() {
 
           <div className="flex items-center gap-2">
             {isDark ? <Moon className="w-4 h-4" style={{ color: t.textMuted }} /> : <Sun className="w-4 h-4" style={{ color: t.textMuted }} />}
-            {status === "unauthenticated" && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', background: t.sessionHover, borderRadius: 20, fontSize: 12, color: t.textMuted }}>
-                Free plan
-                <Link href="/signup" style={{ color: '#6366f1', fontWeight: 500, marginLeft: 4 }}>Upgrade</Link>
-              </div>
-            )}
           </div>
         </header>
 
         {/* Chat area */}
         <div style={{ flex: 1, overflowY: 'auto', scrollbarWidth: 'thin', scrollbarColor: `${t.divider} transparent` }}>
           {messages.length === 0 ? (
-            <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '0 32px' }}>
-              <div style={{ marginBottom: 20 }}>
-                <div style={{ width: 52, height: 52, borderRadius: 16, background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <Bot style={{ width: 26, height: 26, color: '#fff' }} />
-                </div>
-                <h1 style={{ fontSize: 28, fontWeight: 600, color: t.text, textAlign: 'center', margin: 0 }}>
-                  How can I help you, {displayName}?
+            <div className="px-4 md:px-8 py-8" style={{ minHeight: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center', maxWidth: 1000, margin: '0 auto' }}>
+              {/* Header */}
+              <div style={{ marginBottom: 48 }}>
+                <h1 className="text-4xl md:text-5xl" style={{ 
+                  fontWeight: 600, 
+                  background: 'linear-gradient(to right, #4c6ef5, #e64980)',
+                  WebkitBackgroundClip: 'text',
+                  WebkitTextFillColor: 'transparent',
+                  margin: '0 0 8px 0',
+                  letterSpacing: '-0.02em',
+                  lineHeight: 1.2
+                }}>
+                  Hello, {displayName.split(' ')[0]}
                 </h1>
+                <h2 className="text-3xl md:text-4xl" style={{ 
+                  fontWeight: 500, 
+                  color: isDark ? '#4a4845' : '#c4c2be',
+                  margin: 0,
+                  letterSpacing: '-0.02em',
+                  lineHeight: 1.2
+                }}>
+                  How can I help you today?
+                </h2>
+              </div>
+
+              {/* Cards */}
+              <div style={{ 
+                display: 'grid', 
+                gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', 
+                gap: 12,
+                width: '100%',
+                maxWidth: 850
+              }}>
+                {/* Card 1 */}
+                <div 
+                  onClick={() => { setInputText("Explain Python concepts: creating and filtering a dictionary"); textareaRef.current?.focus(); }}
+                  style={{ background: t.userBubble, borderRadius: 12, padding: 12, display: 'flex', flexDirection: 'column', gap: 12, cursor: 'pointer', height: 160, transition: 'background 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = t.sessionHover}
+                  onMouseLeave={(e) => e.currentTarget.style.background = t.userBubble}
+                >
+                  <span style={{ fontSize: 13, fontWeight: 500, color: t.text, lineHeight: 1.3 }}>Explain Python concepts</span>
+                  <div style={{ flex: 1, position: 'relative' }}>
+                    <div style={{ fontSize: 9, color: t.textMuted, fontFamily: 'monospace', lineHeight: 1.5, opacity: 0.8 }}>
+                      1. Creating a dictionary:<br/>
+                      sq = &#123;x: x**<span style={{color: '#f59e0b'}}>2</span> <span style={{color: '#6366f1'}}>for</span> x <span style={{color: '#6366f1'}}>in</span> <span style={{color: '#10b981'}}>range</span>(<span style={{color: '#f59e0b'}}>1</span>, <span style={{color: '#f59e0b'}}>6</span>)&#125;<br/>
+                      <span style={{color: '#10b981'}}>print</span>(sq) <span style={{color: '#a1a1aa'}}># &#123;1: 1...&#125;</span><br/>
+                      2. Filtering a dict
+                    </div>
+                  </div>
+                </div>
+                
+                {/* Card 2 */}
+                <div 
+                  onClick={() => { setInputText("Create an outline from my content"); textareaRef.current?.focus(); }}
+                  style={{ background: t.userBubble, borderRadius: 12, padding: 12, display: 'flex', flexDirection: 'column', gap: 12, cursor: 'pointer', height: 160, transition: 'background 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = t.sessionHover}
+                  onMouseLeave={(e) => e.currentTarget.style.background = t.userBubble}
+                >
+                  <span style={{ fontSize: 13, fontWeight: 500, color: t.text, lineHeight: 1.3 }}>Create an outline from my content</span>
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative', marginTop: 4 }}>
+                     <div style={{ width: 50, height: 65, background: t.mainBg, borderRadius: 6, boxShadow: '0 4px 10px rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '8px 8px' }}>
+                        <div style={{ background: '#ef4444', color: 'white', fontSize: 8, fontWeight: 700, padding: '1px 4px', borderRadius: 3, alignSelf: 'flex-start', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 3 }}>
+                          <span style={{ width: 8, height: 8, background: 'white', borderRadius: 2, display: 'inline-block' }}></span> PDF
+                        </div>
+                        <div style={{ width: '100%', height: 3, background: t.sidebarBorder, borderRadius: 1.5, marginBottom: 5 }}></div>
+                        <div style={{ width: '100%', height: 3, background: t.sidebarBorder, borderRadius: 1.5, marginBottom: 5 }}></div>
+                        <div style={{ width: '60%', height: 3, background: t.sidebarBorder, borderRadius: 1.5, alignSelf: 'flex-start' }}></div>
+                     </div>
+                     <div style={{ position: 'absolute', right: '15%', top: '5%', width: 20, height: 20, borderRadius: 10, background: '#4c6ef5', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 6px rgba(76, 110, 245, 0.4)' }}>
+                       <Plus size={12} />
+                     </div>
+                  </div>
+                </div>
+
+                {/* Card 3 */}
+                <div 
+                  onClick={() => { setInputText("Develop a board game shop business plan"); textareaRef.current?.focus(); }}
+                  style={{ background: t.userBubble, borderRadius: 12, padding: 12, display: 'flex', flexDirection: 'column', gap: 12, cursor: 'pointer', height: 160, transition: 'background 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = t.sessionHover}
+                  onMouseLeave={(e) => e.currentTarget.style.background = t.userBubble}
+                >
+                  <span style={{ fontSize: 13, fontWeight: 500, color: t.text, lineHeight: 1.3 }}>Develop a board game shop business plan</span>
+                  <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+                    <p style={{ fontSize: 10, color: t.textMuted, lineHeight: 1.5, margin: 0, opacity: 0.8 }}>
+                      Business Plan: [Your Shop Name] - Atlanta's Premier Board Game Destination<br/><br/>
+                      1. Executive Summary<br/>
+                      [Your Shop Name] will be a unique retail establishment dedicated to...
+                    </p>
+                    <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 30, background: `linear-gradient(transparent, ${t.userBubble})` }}></div>
+                  </div>
+                </div>
+
+                {/* Card 4 */}
+                <div 
+                  onClick={() => { setInputText("Make a chart and share insights"); textareaRef.current?.focus(); }}
+                  style={{ background: t.userBubble, borderRadius: 12, padding: 12, display: 'flex', flexDirection: 'column', gap: 12, cursor: 'pointer', height: 160, transition: 'background 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = t.sessionHover}
+                  onMouseLeave={(e) => e.currentTarget.style.background = t.userBubble}
+                >
+                  <span style={{ fontSize: 13, fontWeight: 500, color: t.text, lineHeight: 1.3 }}>Make a chart and share insights</span>
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'flex-end', justifyContent: 'center', gap: 3, paddingBottom: 2 }}>
+                    {[45, 30, 80, 55, 40, 20, 35, 65, 45].map((h, i) => (
+                      <div key={i} style={{ width: 10, height: `${h}%`, background: '#4c6ef5', borderRadius: '2px 2px 0 0' }}></div>
+                    ))}
+                  </div>
+                </div>
               </div>
             </div>
           ) : (
-            <div style={{ maxWidth: 720, margin: '0 auto', padding: '32px 32px 8px', display: 'flex', flexDirection: 'column', gap: 24 }}>
+            <div className="px-4 md:px-8 pt-6 md:pt-8 pb-2" style={{ maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 24 }}>
               {messages.map((m, idx) => (
                 <div key={idx}>
                   {m.role === "user" ? (
@@ -858,7 +988,7 @@ export default function ChatPage() {
         </div>
 
         {/* Input area */}
-        <div style={{ flexShrink: 0, padding: '12px 32px 20px', background: t.mainBg, borderTop: `1px solid ${t.topBarBorder}` }}>
+        <div className="px-4 md:px-8 pt-3 pb-5" style={{ flexShrink: 0, background: t.mainBg, borderTop: `1px solid ${t.topBarBorder}` }}>
           <div style={{ maxWidth: 720, margin: '0 auto' }}>
 
             {/* Error / Info Chips */}
@@ -1059,6 +1189,38 @@ export default function ChatPage() {
           </div>
         </div>
       </main>
+
+      {/* Delete Confirmation Modal */}
+      {sessionToDelete && (
+        <>
+          <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm transition-opacity" onClick={() => setSessionToDelete(null)} />
+          <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-sm p-6 rounded-2xl shadow-2xl flex flex-col gap-4 animate-in fade-in zoom-in duration-200"
+               style={{ background: t.menuBg, border: `1px solid ${t.menuBorder}` }}>
+            <h3 style={{ color: t.heading, fontSize: 18, fontWeight: 600 }}>Delete chat?</h3>
+            <p style={{ color: t.text, fontSize: 14 }}>
+              This will delete this chat. This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-3 mt-2">
+              <button 
+                onClick={() => setSessionToDelete(null)}
+                className="px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                style={{ color: t.text, background: t.userBubble }}
+                onMouseEnter={(e) => e.currentTarget.style.opacity = '0.8'}
+                onMouseLeave={(e) => e.currentTarget.style.opacity = '1'}
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={() => deleteSession(sessionToDelete)}
+                className="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors bg-red-500 hover:bg-red-600"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
     </div>
   );
 }
