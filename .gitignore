@@ -45,3 +45,7 @@ backend/test_out.txt
 backend/test_out2.txt
 backend/test_session_isolation.py
 generate_doc.py
+*.docx
+backend/test_title_logic.py
+backend/test_titles.py
+backend/test_upload.py
