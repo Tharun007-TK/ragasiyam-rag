@@ -37,3 +37,11 @@ docker-compose.override.yml
 
 # Docs
 ragasiyam-prd-and-prompts.md
+
+# Scratch files
+backend/docA.txt
+backend/docB.txt
+backend/test_out.txt
+backend/test_out2.txt
+backend/test_session_isolation.py
+generate_doc.py
