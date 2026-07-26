@@ -11,6 +11,10 @@ import {
 import { useSession, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 
 // ─── Theme system ──────────────────────────────────────────────────────────────
 const LIGHT = {
@@ -88,75 +92,74 @@ const DARK = {
 };
 
 // ─── Markdown renderer ─────────────────────────────────────────────────────────
-function InlineMD({ text, t }: { text: string; t: typeof LIGHT }) {
-  const parts: ReactNode[] = [];
-  const regex = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/g;
-  let last = 0, match: RegExpExecArray | null, key = 0;
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > last) parts.push(<span key={key++}>{text.slice(last, match.index)}</span>);
-    const m = match[0];
-    if (m.startsWith("**"))
-      parts.push(<strong key={key++} style={{ color: t.heading, fontWeight: 600 }}>{m.slice(2, -2)}</strong>);
-    else if (m.startsWith("`"))
-      parts.push(
-        <code key={key++} style={{ background: t.inlineCodeBg, color: t.inlineCodeText, padding: '1px 6px', borderRadius: 4, fontSize: '0.83em', fontFamily: 'monospace' }}>
-          {m.slice(1, -1)}
-        </code>
-      );
-    else if (m.startsWith("*"))
-      parts.push(<em key={key++}>{m.slice(1, -1)}</em>);
-    last = match.index + m.length;
+function MarkdownRenderer({ content, t, model }: { content: string; t: typeof LIGHT; model?: string }) {
+  let thinkContent = "";
+  let mainContent = content;
+
+  if (model === "deepseek-r1-distill-llama-70b") {
+    const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+    if (thinkMatch) {
+      thinkContent = thinkMatch[1].trim();
+      mainContent = content.replace(/<think>[\s\S]*?<\/think>/, "").trim();
+    } else if (content.includes("<think>")) {
+      // Still generating thinking block
+      thinkContent = content.replace("<think>", "").trim();
+      mainContent = "";
+    }
   }
-  if (last < text.length) parts.push(<span key={key++}>{text.slice(last)}</span>);
-  return <>{parts.length > 0 ? parts : text}</>;
-}
 
-function MarkdownRenderer({ content, t }: { content: string; t: typeof LIGHT }) {
-  const lines = content.split("\n");
-  const els: ReactNode[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    if (line.startsWith("```")) {
-      const codeLines: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i].startsWith("```")) { codeLines.push(lines[i]); i++; }
-      els.push(
-        <pre key={`cb${i}`} style={{ background: t.codeBlockBg, border: `1px solid ${t.codeBlockBorder}`, borderRadius: 12, padding: '14px 16px', overflowX: 'auto', margin: '10px 0', fontSize: 13 }}>
-          <code style={{ fontFamily: 'monospace', color: t.codeText, lineHeight: 1.6 }}>{codeLines.join("\n")}</code>
-        </pre>
-      );
-      i++; continue;
-    }
-
-    if (line.startsWith("### ")) { els.push(<h3 key={i} style={{ fontWeight: 600, color: t.heading, marginTop: 16, marginBottom: 4, fontSize: 15 }}><InlineMD text={line.slice(4)} t={t} /></h3>); }
-    else if (line.startsWith("## ")) { els.push(<h2 key={i} style={{ fontWeight: 700, color: t.heading, marginTop: 20, marginBottom: 6, fontSize: 17 }}><InlineMD text={line.slice(3)} t={t} /></h2>); }
-    else if (line.startsWith("# "))  { els.push(<h1 key={i} style={{ fontWeight: 700, color: t.heading, marginTop: 20, marginBottom: 8, fontSize: 19 }}><InlineMD text={line.slice(2)} t={t} /></h1>); }
-    else if (line.match(/^-{3,}$/)) { els.push(<hr key={i} style={{ border: 'none', borderTop: `1px solid ${t.divider}`, margin: '12px 0' }} />); }
-    else if (line.match(/^[-*] /)) {
-      const items: string[] = [];
-      while (i < lines.length && lines[i].match(/^[-*] /)) { items.push(lines[i].slice(2)); i++; }
-      els.push(<ul key={`ul${i}`} style={{ listStyleType: 'disc', paddingLeft: 20, margin: '6px 0' }}>{items.map((it, j) => <li key={j} style={{ color: t.listText, lineHeight: 1.7, marginBottom: 2 }}><InlineMD text={it} t={t} /></li>)}</ul>);
-      continue;
-    }
-    else if (line.match(/^\d+\. /)) {
-      const items: string[] = [];
-      while (i < lines.length && lines[i].match(/^\d+\. /)) { items.push(lines[i].replace(/^\d+\.\s/, "")); i++; }
-      els.push(<ol key={`ol${i}`} style={{ listStyleType: 'decimal', paddingLeft: 20, margin: '6px 0' }}>{items.map((it, j) => <li key={j} style={{ color: t.listText, lineHeight: 1.7, marginBottom: 2 }}><InlineMD text={it} t={t} /></li>)}</ol>);
-      continue;
-    }
-    else if (line.trim() === "") { els.push(<div key={i} style={{ height: 10 }} />); }
-    else { els.push(<p key={i} style={{ color: t.listText, lineHeight: 1.75, margin: '2px 0' }}><InlineMD text={line} t={t} /></p>); }
-
-    i++;
-  }
-  return <div style={{ fontSize: 15 }}>{els}</div>;
+  return (
+    <div style={{ fontSize: 15, color: t.text }}>
+      {thinkContent && (
+        <details style={{ marginBottom: 16, background: t.sessionHover, padding: 12, borderRadius: 8, border: `1px solid ${t.divider}` }}>
+          <summary style={{ cursor: "pointer", fontWeight: 600, color: t.textMuted }}>Thinking...</summary>
+          <div style={{ marginTop: 8, color: t.textMuted, fontSize: 14, whiteSpace: "pre-wrap" }}>
+            {thinkContent}
+          </div>
+        </details>
+      )}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          code({node, inline, className, children, ...props}: any) {
+            const match = /language-(\w+)/.exec(className || '')
+            return !inline && match ? (
+              <SyntaxHighlighter
+                {...props}
+                style={vscDarkPlus as any}
+                language={match[1]}
+                PreTag="div"
+                customStyle={{ borderRadius: 8, margin: '10px 0', fontSize: 13 }}
+              >
+                {String(children).replace(/\n$/, '')}
+              </SyntaxHighlighter>
+            ) : (
+              <code {...props} className={className} style={{ background: t.inlineCodeBg, color: t.inlineCodeText, padding: '2px 6px', borderRadius: 4, fontSize: '0.85em' }}>
+                {children}
+              </code>
+            )
+          },
+          p({children}) { return <p style={{ lineHeight: 1.75, margin: '8px 0' }}>{children}</p>; },
+          h1({children}) { return <h1 style={{ fontWeight: 700, marginTop: 24, marginBottom: 12, fontSize: 24 }}>{children}</h1>; },
+          h2({children}) { return <h2 style={{ fontWeight: 700, marginTop: 20, marginBottom: 10, fontSize: 20 }}>{children}</h2>; },
+          h3({children}) { return <h3 style={{ fontWeight: 600, marginTop: 16, marginBottom: 8, fontSize: 18 }}>{children}</h3>; },
+          ul({children}) { return <ul style={{ listStyleType: 'disc', paddingLeft: 24, margin: '8px 0' }}>{children}</ul>; },
+          ol({children}) { return <ol style={{ listStyleType: 'decimal', paddingLeft: 24, margin: '8px 0' }}>{children}</ol>; },
+          li({children}) { return <li style={{ lineHeight: 1.7, marginBottom: 4 }}>{children}</li>; },
+          a({children, href}) { return <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: '#6366f1', textDecoration: 'underline' }}>{children}</a>; },
+          table({children}) { return <div style={{ overflowX: 'auto', margin: '16px 0' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}>{children}</table></div>; },
+          th({children}) { return <th style={{ border: `1px solid ${t.divider}`, padding: '8px 12px', background: t.sessionHover, textAlign: 'left' }}>{children}</th>; },
+          td({children}) { return <td style={{ border: `1px solid ${t.divider}`, padding: '8px 12px' }}>{children}</td>; },
+        }}
+      >
+        {mainContent}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
-type Message  = { role: "user" | "assistant"; content: string; timestamp?: string; imagePreview?: string; };
+type Message  = { role: "user" | "assistant"; content: string; timestamp?: string; imagePreview?: string; model?: string; };
 type ChatSession = { session_id: string; title: string; created_at: string; message_count: number; };
 
 function generateSessionId() {
@@ -399,6 +402,7 @@ export default function ChatPage() {
 
   const [isDark, setIsDarkState] = useState(false);
   const [fontSize, setFontSizeState] = useState("Default");
+  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [messages, setMessages] = useState<Message[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState("");
@@ -409,6 +413,7 @@ export default function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [guestSessionId, setGuestSessionId] = useState("");
   const [guestMessageCount, setGuestMessageCount] = useState(0);
@@ -416,6 +421,9 @@ export default function ChatPage() {
   const [hoveredSession, setHoveredSession] = useState<string | null>(null);
   const [pendingImage, setPendingImage] = useState<File | null>(null);
   const [pendingImagePreview, setPendingImagePreview] = useState("");
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadInfo, setUploadInfo] = useState<string | null>(null);
 
   const messagesEndRef  = useRef<HTMLDivElement>(null);
   const fileInputRef    = useRef<HTMLInputElement>(null);
@@ -504,8 +512,9 @@ export default function ChatPage() {
   const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!["image/jpeg","image/png","image/webp","image/gif"].includes(file.type)) { alert("JPEG, PNG, WebP or GIF only."); return; }
-    if (file.size > 10 * 1024 * 1024) { alert("Max 10 MB."); return; }
+    setUploadError(null); setUploadInfo(null);
+    if (!["image/jpeg","image/png","image/webp","image/gif"].includes(file.type)) { setUploadError("JPEG, PNG, WebP or GIF only."); return; }
+    if (file.size > 50 * 1024 * 1024) { setUploadError("Max 50 MB."); return; }
     setPendingImage(file);
     const r = new FileReader();
     r.onload = (ev) => setPendingImagePreview(ev.target?.result as string);
@@ -530,11 +539,11 @@ export default function ChatPage() {
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Vision failed");
         data = await r.json();
       } else {
-        const r = await fetch(`${API_BASE}/chat`, { method: "POST", headers: { "Content-Type": "application/json", ...getHeaders() }, body: JSON.stringify({ message: text, session_id: currentSessionId }) });
+        const r = await fetch(`${API_BASE}/chat`, { method: "POST", headers: { "Content-Type": "application/json", ...getHeaders() }, body: JSON.stringify({ message: text, session_id: currentSessionId, model: selectedModel }) });
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Request failed");
         data = await r.json();
       }
-      setMessages((p) => [...p, { role: "assistant", content: data.reply }]);
+      setMessages((p) => [...p, { role: "assistant", content: data.reply, model: selectedModel }]);
       setTimeout(() => fetchSessions(), 500);
     } catch (err: any) {
       setMessages((p) => [...p, { role: "assistant", content: `Error: ${err.message}` }]);
@@ -545,7 +554,12 @@ export default function ChatPage() {
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setUploadError(null); setUploadInfo(null);
+    if (file.size > 20 * 1024 * 1024) {
+      setUploadInfo("Larger files take longer to process. Please wait...");
+    }
     setIsUploading(true);
+    setPendingFile(file);
     const fd = new FormData(); fd.append("file", file);
     try {
       const r = await fetch(`${API_BASE}/upload`, { method: "POST", headers: getHeaders(), body: fd });
@@ -557,13 +571,13 @@ export default function ChatPage() {
             const s = await fetch(`${API_BASE}/upload/status/${doc_id}`, { headers: getHeaders() });
             if (s.ok) {
               const { status: st } = await s.json();
-              if (st === "ready") { clearInterval(poll); setIsUploading(false); setMessages((p) => [...p, { role: "assistant", content: `Document ingested: **${file.name}**` }]); }
-              else if (st === "failed") { clearInterval(poll); setIsUploading(false); alert("Failed."); }
+              if (st === "ready") { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadInfo(null); setMessages((p) => [...p, { role: "assistant", content: `Document ingested: **${file.name}**` }]); }
+              else if (st === "failed") { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadError("Document ingestion failed."); }
             }
-          } catch { clearInterval(poll); setIsUploading(false); }
+          } catch { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadError("Polling failed."); }
         }, 2000);
-      } else throw new Error((await r.json()).detail || "Upload failed");
-    } catch (err: any) { alert(err.message); setIsUploading(false); if (fileInputRef.current) fileInputRef.current.value = ""; }
+      } else throw new Error((await r.json().catch(() => ({}))).detail || "Upload failed");
+    } catch (err: any) { setUploadError(err.message); setIsUploading(false); setPendingFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }
   };
 
   if (status === "loading") {
@@ -818,7 +832,7 @@ export default function ChatPage() {
                         <Bot style={{ width: 14, height: 14, color: '#fff' }} />
                       </div>
                       <div style={{ flex: 1, minWidth: 0, paddingTop: 2 }}>
-                        <MarkdownRenderer content={m.content} t={t} />
+                        <MarkdownRenderer content={m.content} t={t} model={m.model} />
                       </div>
                     </div>
                   )}
@@ -837,11 +851,7 @@ export default function ChatPage() {
                   </div>
                 </div>
               )}
-              {isUploading && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: t.textMuted }}>
-                  <Paperclip style={{ width: 14, height: 14 }} /> Ingesting document…
-                </div>
-              )}
+
               <div ref={messagesEndRef} />
             </div>
           )}
@@ -850,6 +860,36 @@ export default function ChatPage() {
         {/* Input area */}
         <div style={{ flexShrink: 0, padding: '12px 32px 20px', background: t.mainBg, borderTop: `1px solid ${t.topBarBorder}` }}>
           <div style={{ maxWidth: 720, margin: '0 auto' }}>
+
+            {/* Error / Info Chips */}
+            {uploadError && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10, padding: '10px 14px', background: 'rgba(239,68,68,0.1)', color: '#ef4444', borderRadius: 12, border: '1px solid rgba(239,68,68,0.2)', fontSize: 13, fontWeight: 500 }}>
+                <span style={{ flex: 1 }}>{uploadError}</span>
+                <button onClick={() => setUploadError(null)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#ef4444', display: 'flex' }}><X style={{ width: 16, height: 16 }} /></button>
+              </div>
+            )}
+            {uploadInfo && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10, padding: '10px 14px', background: 'rgba(59,130,246,0.1)', color: '#3b82f6', borderRadius: 12, border: '1px solid rgba(59,130,246,0.2)', fontSize: 13, fontWeight: 500 }}>
+                <span style={{ flex: 1 }}>{uploadInfo}</span>
+                <button onClick={() => setUploadInfo(null)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#3b82f6', display: 'flex' }}><X style={{ width: 16, height: 16 }} /></button>
+              </div>
+            )}
+            
+            {/* Pending File Upload Chip */}
+            {pendingFile && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10, padding: '8px 12px', background: t.sessionHover, borderRadius: 14, border: `1px solid ${t.divider}` }}>
+                <div style={{ position: 'relative', flexShrink: 0, width: 44, height: 44, borderRadius: 10, background: isDark ? '#2e2e38' : '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', border: `1px solid ${t.divider}` }}>
+                  <Paperclip style={{ width: 20, height: 20, color: t.textMuted }} />
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <p style={{ fontSize: 13, fontWeight: 600, color: t.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{pendingFile.name}</p>
+                  <p style={{ fontSize: 12, color: t.textMuted, marginTop: 2 }}>{(pendingFile.size / 1024).toFixed(0)} KB · {isUploading ? 'Uploading & Ingesting...' : 'Ready'}</p>
+                </div>
+                {isUploading && (
+                  <div style={{ marginRight: 4, width: 20, height: 20, borderRadius: '50%', border: '2.5px solid #6366f1', borderTopColor: 'transparent', animation: 'spin 0.8s linear infinite' }} />
+                )}
+              </div>
+            )}
 
             {/* Image preview */}
             {pendingImagePreview && (
@@ -939,13 +979,57 @@ export default function ChatPage() {
                   </div>
 
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    {/* Model label */}
-                    <button style={{ display: 'none', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 10, fontSize: 12, color: t.textMuted, background: 'transparent', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
-                      className="sm:flex">
-                      <span style={{ color: '#6366f1', fontWeight: 600, fontSize: 11 }}>RAG</span>
-                      <span>'asiam Pro</span>
-                      <ChevronDown style={{ width: 12, height: 12, color: t.textFaint }} />
-                    </button>
+                    {/* Model selector */}
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        onClick={() => setModelMenuOpen(!modelMenuOpen)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px',
+                          borderRadius: 10, fontSize: 13, color: t.textMuted, fontWeight: 500,
+                          background: modelMenuOpen ? t.toolbarBtnHoverBg : 'transparent',
+                          border: 'none', cursor: 'pointer', fontFamily: 'inherit'
+                        }}
+                        onMouseEnter={(e) => { if(!modelMenuOpen) e.currentTarget.style.background = t.toolbarBtnHoverBg; }}
+                        onMouseLeave={(e) => { if(!modelMenuOpen) e.currentTarget.style.background = 'transparent'; }}
+                      >
+                        {selectedModel.includes("deepseek") ? "Deepseek R1" : selectedModel.includes("llama") ? "Groq Llama 3.3" : "Gemini 2.5 Flash"}
+                        <ChevronDown style={{ width: 14, height: 14, color: t.textFaint }} />
+                      </button>
+
+                      {modelMenuOpen && (
+                        <>
+                          <div className="fixed inset-0 z-40" onClick={() => setModelMenuOpen(false)} />
+                          <div
+                            className="absolute z-50 mb-2 bottom-full left-0 w-64 rounded-xl shadow-xl overflow-hidden"
+                            style={{ background: t.menuBg, border: `1px solid ${t.menuBorder}` }}
+                          >
+                            {[
+                              { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", desc: "Fast and multimodal (Google)" },
+                              { id: "llama-3.3-70b-versatile", name: "Groq Llama 3.3", desc: "High speed text generation" },
+                              { id: "deepseek-r1-distill-llama-70b", name: "Deepseek R1", desc: "Advanced reasoning and logic" },
+                            ].map((mod, idx) => (
+                              <button
+                                key={mod.id}
+                                onClick={() => { setSelectedModel(mod.id); setModelMenuOpen(false); }}
+                                className="w-full text-left px-4 py-3 flex items-center justify-between transition-colors"
+                                style={{
+                                  background: selectedModel === mod.id ? t.sessionHover : 'transparent',
+                                  borderBottom: idx < 2 ? `1px solid ${t.divider}` : 'none'
+                                }}
+                                onMouseEnter={(e) => { if(selectedModel !== mod.id) e.currentTarget.style.background = t.menuHover; }}
+                                onMouseLeave={(e) => { if(selectedModel !== mod.id) e.currentTarget.style.background = 'transparent'; }}
+                              >
+                                <div>
+                                  <div style={{ fontSize: 14, fontWeight: 500, color: t.text, marginBottom: 2 }}>{mod.name}</div>
+                                  <div style={{ fontSize: 12, color: t.textMuted }}>{mod.desc}</div>
+                                </div>
+                                {selectedModel === mod.id && <Check className="w-4 h-4" style={{ color: '#6366f1' }} />}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
 
                     {/* Mic */}
                     <button style={{ padding: 8, borderRadius: 10, color: t.toolbarBtn, background: 'transparent', border: 'none', cursor: 'pointer', display: 'flex' }}
