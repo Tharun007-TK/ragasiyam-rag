@@ -13,6 +13,8 @@ qdrant-client==1.9.1
 pypdf==4.2.0
 # protobuf must stay <5 — google-generativeai 0.7.x upper bound
 protobuf>=3.19.5,<5.0.0dev
-
+# Pin grpcio to a version with prebuilt wheels to avoid build failure on Render
+grpcio==1.62.2
+grpcio-tools==1.62.2
 groq
 cohere
