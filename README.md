@@ -5,20 +5,48 @@ RAG'asiyam is an intelligent, full-stack conversational assistant powered by Ret
 ## Architecture
 
 ```mermaid
-graph TD
-    User([User]) -->|Interacts| UI[Next.js 14 Frontend]
-    UI -->|Upload Document| API[FastAPI Backend]
-    UI -->|Ask Question| API
-    API -->|Extract & Chunk| LangChain[LangChain Splitter]
-    LangChain -->|Embed Text| Embed[Gemini Embedding 2]
-    Embed -->|Store Vectors| Qdrant[(Qdrant Vector DB)]
-    
-    API -->|Retrieve Context| Qdrant
-    Qdrant -->|Return Relevant Chunks| API
-    API -->|Construct Grounded Prompt| GenAI[Gemini 2.5 Flash]
-    GenAI -->|Stream Response| UI
-    
-    API -->|Save Chat History| Mongo[(MongoDB)]
+flowchart TD
+    User(["👤 User"])
+
+    subgraph FE["🖥️ Frontend — Next.js 14"]
+        UI["Chat Interface\n& Document Upload"]
+    end
+
+    subgraph BE["⚙️ Backend — FastAPI"]
+        API["API Server\n/chat · /upload · /sessions"]
+    end
+
+    subgraph RAG["📚 RAG Pipeline"]
+        Splitter["LangChain\nText Splitter"]
+        Embedder["Cohere\nEmbeddings"]
+    end
+
+    subgraph AI["🤖 LLM Providers"]
+        Gemini["Gemini 2.5 Flash"]
+        Groq["Groq\nllama-3.1-8b"]
+    end
+
+    subgraph DB["🗄️ Data Layer"]
+        Qdrant[("Qdrant\nVector DB")]
+        Mongo[("MongoDB Atlas\nChat History")]
+    end
+
+    User -->|"asks / uploads"| UI
+    UI -->|"HTTP / Stream"| API
+
+    API -->|"chunk document"| Splitter
+    Splitter -->|"embed chunks"| Embedder
+    Embedder -->|"store vectors"| Qdrant
+
+    API -->|"semantic search"| Qdrant
+    Qdrant -->|"top-k chunks"| API
+
+    API -->|"grounded prompt"| Gemini
+    API -->|"title summary"| Groq
+    Gemini -->|"streamed reply"| UI
+
+    API -->|"persist messages"| Mongo
+    Mongo -->|"load history"| API
 ```
 
 ## Features
