@@ -5,48 +5,53 @@ RAG'asiyam is an intelligent, full-stack conversational assistant powered by Ret
 ## Architecture
 
 ```mermaid
-flowchart TD
-    User(["👤 User"])
+flowchart LR
+    classDef user     fill:#1a1a2e,stroke:#4f8ef7,color:#fff,rx:20
+    classDef frontend fill:#162032,stroke:#38bdf8,color:#fff
+    classDef backend  fill:#162032,stroke:#38bdf8,color:#fff
+    classDef rag      fill:#0f2027,stroke:#34d399,color:#fff
+    classDef llm      fill:#0f2027,stroke:#a78bfa,color:#fff
+    classDef db       fill:#0f2027,stroke:#fb923c,color:#fff,rx:6
 
-    subgraph FE["🖥️ Frontend — Next.js 14"]
-        UI["Chat Interface\n& Document Upload"]
+    User(["User"]):::user
+
+    subgraph FE["Frontend"]
+        UI["Next.js 14\nChat Interface"]:::frontend
     end
 
-    subgraph BE["⚙️ Backend — FastAPI"]
-        API["API Server\n/chat · /upload · /sessions"]
+    subgraph BE["Backend"]
+        API["FastAPI\nServer"]:::backend
     end
 
-    subgraph RAG["📚 RAG Pipeline"]
-        Splitter["LangChain\nText Splitter"]
-        Embedder["Cohere\nEmbeddings"]
+    subgraph RAG["RAG Pipeline"]
+        direction TB
+        Splitter["LangChain\nSplitter"]:::rag
+        Embedder["Cohere\nEmbeddings"]:::rag
+        Splitter --> Embedder
     end
 
-    subgraph AI["🤖 LLM Providers"]
-        Gemini["Gemini 2.5 Flash"]
-        Groq["Groq\nllama-3.1-8b"]
+    subgraph LLM["LLM Providers"]
+        direction TB
+        Gemini["Gemini\n2.5 Flash"]:::llm
+        Groq["Groq\nLlama 3.1"]:::llm
     end
 
-    subgraph DB["🗄️ Data Layer"]
-        Qdrant[("Qdrant\nVector DB")]
-        Mongo[("MongoDB Atlas\nChat History")]
+    subgraph DATA["Data Layer"]
+        direction TB
+        Qdrant[("Qdrant\nVector DB")]:::db
+        Mongo[("MongoDB\nAtlas")]:::db
     end
 
-    User -->|"asks / uploads"| UI
-    UI -->|"HTTP / Stream"| API
-
-    API -->|"chunk document"| Splitter
-    Splitter -->|"embed chunks"| Embedder
-    Embedder -->|"store vectors"| Qdrant
-
-    API -->|"semantic search"| Qdrant
-    Qdrant -->|"top-k chunks"| API
-
-    API -->|"grounded prompt"| Gemini
-    API -->|"title summary"| Groq
-    Gemini -->|"streamed reply"| UI
-
-    API -->|"persist messages"| Mongo
-    Mongo -->|"load history"| API
+    User -->|ask / upload| UI
+    UI -->|HTTP| API
+    API -->|chunk| Splitter
+    Embedder -->|store| Qdrant
+    API -->|search| Qdrant
+    Qdrant -->|top-k chunks| API
+    API -->|prompt| Gemini
+    Gemini -->|stream| UI
+    API -->|title gen| Groq
+    API <-->|history| Mongo
 ```
 
 ## Features
