@@ -324,7 +324,7 @@ function SettingsModal({
                     <Bot className="w-5 h-5 text-white" />
                   </div>
                   <div>
-                    <p style={{ fontSize: 14, fontWeight: 600, color: t.text }}><span style={{ color: '#6366f1' }}>RAG</span>'asiam</p>
+                    <p style={{ fontSize: 14, fontWeight: 600, color: t.text }}><span style={{ color: '#6366f1' }}>RAG</span>'asiyam</p>
                     <p style={{ fontSize: 12, color: t.textMuted }}>Version 1.0.0 · Retrieval-Augmented Generation</p>
                   </div>
                 </div>
@@ -365,7 +365,7 @@ function HelpModal({ onClose, t }: { onClose: () => void; t: typeof LIGHT }) {
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4" style={{ borderBottom: `1px solid ${t.divider}` }}>
-          <h2 style={{ fontSize: 18, fontWeight: 600, color: t.text }}>How to use RAG'asiam</h2>
+          <h2 style={{ fontSize: 18, fontWeight: 600, color: t.text }}>How to use RAG'asiyam</h2>
           <button onClick={onClose} className="p-1.5 rounded-lg transition-colors" style={{ color: t.textMuted }} onMouseEnter={(e) => { (e.target as HTMLElement).style.background = t.menuHover; }} onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent'; }}>
             <X className="w-5 h-5" />
           </button>
@@ -373,7 +373,7 @@ function HelpModal({ onClose, t }: { onClose: () => void; t: typeof LIGHT }) {
         
         {/* Content */}
         <div className="px-6 py-5 overflow-y-auto no-scrollbar space-y-4" style={{ color: t.listText, fontSize: 15, lineHeight: 1.6 }}>
-          <p>Welcome to <strong>RAG'asiam</strong>, your intelligent conversational assistant powered by Retrieval-Augmented Generation.</p>
+          <p>Welcome to <strong>RAG'asiyam</strong>, your intelligent conversational assistant powered by Retrieval-Augmented Generation.</p>
           <h3 style={{ fontWeight: 600, color: t.heading, marginTop: 12 }}>Features</h3>
           <ul style={{ listStyleType: 'disc', paddingLeft: 20 }} className="space-y-1">
             <li><strong>Chat:</strong> Simply type your message in the text box and press Enter to start chatting.</li>
@@ -429,16 +429,15 @@ export default function ChatPage() {
   const API_BASE    = "/api/py";
   const GUEST_LIMIT = 3;
 
-  const setIsDark = (v: boolean) => { setIsDarkState(v); localStorage.setItem("ragasiam_theme", v ? "dark" : "light"); };
-  const setFontSize = (v: string) => { setFontSizeState(v); localStorage.setItem("ragasiam_font", v); };
+  const setIsDark = (v: boolean) => { setIsDarkState(v); localStorage.setItem("ragasiyam_theme", v ? "dark" : "light"); };
+  const setFontSize = (v: string) => { setFontSizeState(v); localStorage.setItem("ragasiyam_font", v); };
 
   const fontSizePx = fontSize === "Small" ? 14 : fontSize === "Large" ? 16 : 15;
 
-  // Persist theme
   useEffect(() => {
-    const saved = localStorage.getItem("ragasiam_theme");
+    const saved = localStorage.getItem("ragasiyam_theme");
     if (saved) setIsDarkState(saved === "dark");
-    const savedFont = localStorage.getItem("ragasiam_font");
+    const savedFont = localStorage.getItem("ragasiyam_font");
     if (savedFont) setFontSizeState(savedFont);
   }, []);
 
@@ -621,7 +620,7 @@ export default function ChatPage() {
       {/* Brand */}
       <div className="flex items-center justify-between px-4 pt-5 pb-2">
         <span style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.01em' }}>
-          <span style={{ color: '#6366f1' }}>RAG</span><span style={{ color: t.text }}>'asiam</span>
+          <span style={{ color: '#6366f1' }}>RAG</span><span style={{ color: t.text }}>'asiyam</span>
         </span>
         <div className="flex items-center gap-0.5">
           <button className="p-1.5 rounded-lg transition-colors" style={{ color: t.textMuted }} title="Search"
@@ -824,7 +823,7 @@ export default function ChatPage() {
               </button>
             ) : (
               <span style={{ fontSize: 14, fontWeight: 600 }}>
-                <span style={{ color: '#6366f1' }}>RAG</span><span style={{ color: t.text }}>'asiam</span>
+                <span style={{ color: '#6366f1' }}>RAG</span><span style={{ color: t.text }}>'asiyam</span>
               </span>
             )}
           </div>
@@ -1184,7 +1183,7 @@ export default function ChatPage() {
 
             {/* Disclaimer */}
             <p style={{ textAlign: 'center', fontSize: 11, color: t.disclaimer, marginTop: 8 }}>
-              <span style={{ color: '#6366f1' }}>RAG</span>'asiam can make mistakes. Always verify important information.
+              <span style={{ color: '#6366f1' }}>RAG</span>'asiyam can make mistakes. Always verify important information.
             </p>
           </div>
         </div>

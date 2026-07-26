@@ -1,6 +1,6 @@
-# RAG'asiam
+# RAG'asiyam
 
-RAG'asiam is an intelligent, full-stack conversational assistant powered by Retrieval-Augmented Generation (RAG). Featuring a premium Claude-inspired user interface, it seamlessly handles textual conversations, contextual document Q&A, and multimodal image analysis.
+RAG'asiyam is an intelligent, full-stack conversational assistant powered by Retrieval-Augmented Generation (RAG). Featuring a premium Claude-inspired user interface, it seamlessly handles textual conversations, contextual document Q&A, and multimodal image analysis.
 
 ## Architecture
 
@@ -23,7 +23,7 @@ graph TD
 
 ## Features
 
-- **Contextual RAG (Document Q&A):** Upload PDF or TXT files. RAG'asiam automatically ingests the documents into a vector database and grounds its answers based on your data.
+- **Contextual RAG (Document Q&A):** Upload PDF or TXT files. RAG'asiyam automatically ingests the documents into a vector database and grounds its answers based on your data.
 - **Multimodal Vision:** Upload images (JPEG, PNG, WebP, GIF) to ask questions, describe content, or analyze visual data effortlessly using Gemini Vision models.
 - **Premium User Interface:** A sleek, Claude-inspired design with an ambient pulsing glow around the input box, smooth micro-animations, and a responsive layout.
 - **Dark Mode Support:** Visually stunning dark and light modes, fully togglable via the user settings modal and persisted to your local storage.
@@ -94,7 +94,7 @@ npm install
 npm run dev
 ```
 
-Open your browser and navigate to **http://localhost:3000** to start interacting with RAG'asiam!
+Open your browser and navigate to **http://localhost:3000** to start interacting with RAG'asiyam!
 
 ---
 
