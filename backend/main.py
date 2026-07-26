@@ -297,7 +297,8 @@ async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assi
             raise ValueError("No GROQ_API_KEY")
         
         prompt = (
-            "Summarize this conversation in 4-6 words as a title, no punctuation at the end, no quotes: "
+            "Summarize this conversation in 4-6 words as a title, no punctuation at the end, no quotes. "
+            "Do not use bracketed tags like [Image]. If the user message is just an image or empty, summarize based on the assistant's reply:\n"
             f"User: {user_msg}\nAssistant: {assistant_msg}"
         )
         
@@ -311,9 +312,13 @@ async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assi
             timeout=10.0
         )
         title = res.choices[0].message.content.strip(' ".\'\n')
+        # Sometimes it still returns [Image], fallback to assistant message
+        if title.lower() == "[image]" or not title:
+            raise ValueError("Bad title generated")
     except Exception as e:
-        print(f"[title] Groq title generation failed: {e}")
-        title = (user_msg[:40] + "...") if len(user_msg) > 40 else user_msg
+        print(f"[title] Groq title generation failed or returned bad title: {e}")
+        fallback_msg = user_msg if (user_msg and user_msg.lower() not in ["", "[image]", "[file]"]) else assistant_msg
+        title = (fallback_msg[:40] + "...") if len(fallback_msg) > 40 else fallback_msg
 
     try:
         await chats_col.update_many(
