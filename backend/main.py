@@ -69,18 +69,26 @@ chats_col    = db["chats"]
 uploads_col  = db["uploads"]
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
-COLLECTION_NAME      = "ragasiyam_documents"
-VECTOR_SIZE          = 3072   # matches gemini-embedding-2
+COLLECTION_NAME      = "ragasiyam_documents_cohere"
+VECTOR_SIZE          = 1024   # matches cohere embed-english-v3.0
 SIMILARITY_THRESHOLD = 0.55   # cosine score below this = not relevant enough to inject as RAG context
 TOP_K                = 4      # chunks to retrieve
+
+# ── Cohere ────────────────────────────────────────────────────────────────────
+import cohere
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
+# Fallback to empty string or a dummy key to prevent startup crash if missing
+co = cohere.Client(api_key=COHERE_API_KEY if COHERE_API_KEY else "dummy_key")
 
 QDRANT_URL     = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 if QDRANT_URL and QDRANT_API_KEY:
-    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    print(f"[init] QdrantClient config: url={QDRANT_URL}, prefer_grpc=False, timeout=60")
+    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60)
 else:
-    qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    print(f"[init] QdrantClient config: host={QDRANT_HOST}, port={QDRANT_PORT}, prefer_grpc=False, timeout=60")
+    qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, prefer_grpc=False, timeout=60)
 splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -135,7 +143,15 @@ def ensure_collection():
             field_schema="keyword"
         )
     except Exception as e:
-        # Ignore if index already exists or other non-fatal errors
+        pass
+        
+    try:
+        qdrant.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="session_id",
+            field_schema="keyword"
+        )
+    except Exception as e:
         pass
 
 
@@ -143,16 +159,41 @@ def ensure_collection():
 async def startup():
     """Attempt to create Qdrant collection on startup with retries (Docker warmup lag)."""
     import time
+    
+    # Standalone diagnostic test
+    print("[startup] Running standalone Qdrant connection test...")
+    try:
+        collections = await asyncio.to_thread(qdrant.get_collections)
+        print(f"[startup] Standalone test SUCCESS. Collections found: {len(collections.collections)}")
+    except Exception as e:
+        print(f"[startup] Standalone test FAILED: {type(e).__name__}: {e}")
+    collection_ready = False
     for attempt in range(10):
         try:
             await asyncio.to_thread(ensure_collection)
-            return
+            collection_ready = True
+            break
         except Exception as exc:
             if attempt < 9:
                 await asyncio.sleep(2)
             else:
                 # Non-fatal: collection will be created lazily on first /upload
                 print(f"[startup] Qdrant not ready after 10 attempts: {exc}")
+
+    if collection_ready:
+        print("[startup] Running standalone Qdrant trivial upsert test...")
+        try:
+            dummy_point = PointStruct(
+                id=str(uuid.uuid4()),
+                vector=[0.0] * VECTOR_SIZE,
+                payload={"test": True}
+            )
+            await asyncio.to_thread(
+                qdrant.upsert, collection_name=COLLECTION_NAME, points=[dummy_point]
+            )
+            print("[startup] Trivial upsert test SUCCESS.")
+        except Exception as e:
+            print(f"[startup] Trivial upsert test FAILED: {type(e).__name__}: {e}")
 
 
 @app.get("/")
@@ -184,25 +225,41 @@ class SessionOut(BaseModel):
 
 # ── Embedding helper (sync, run in thread pool) ───────────────────────────────
 def _embed_sync(text: str, task_type: str) -> list[float]:
-    result = genai.embed_content(
-        model=EMBED_MODEL,
-        content=text,
-        task_type=task_type,
-    )
-    return result["embedding"]
+    import time
+    for attempt in range(5):
+        try:
+            response = co.embed(
+                texts=[text],
+                model="embed-english-v3.0",
+                input_type=task_type,
+            )
+            return response.embeddings[0]
+        except Exception as e:
+            if attempt < 4:
+                time.sleep(2 ** attempt)
+            else:
+                raise e
 
 def _embed_batch_sync(texts: list[str], task_type: str) -> list[list[float]]:
-    result = genai.embed_content(
-        model=EMBED_MODEL,
-        content=texts,
-        task_type=task_type,
-    )
-    return result["embedding"]
+    import time
+    for attempt in range(5):
+        try:
+            response = co.embed(
+                texts=texts,
+                model="embed-english-v3.0",
+                input_type=task_type,
+            )
+            return response.embeddings
+        except Exception as e:
+            if attempt < 4:
+                time.sleep(2 ** attempt)
+            else:
+                raise e
 
-async def embed(text: str, task_type: str = "retrieval_document") -> list[float]:
+async def embed(text: str, task_type: str = "search_document") -> list[float]:
     return await asyncio.to_thread(_embed_sync, text, task_type)
 
-async def embed_batch(texts: list[str], task_type: str = "retrieval_document") -> list[list[float]]:
+async def embed_batch(texts: list[str], task_type: str = "search_document") -> list[list[float]]:
     return await asyncio.to_thread(_embed_batch_sync, texts, task_type)
 
 
@@ -235,7 +292,7 @@ async def save_message(user_id: str, role: str, content: str, session_id: str = 
 
 
 # ── POST /upload ──────────────────────────────────────────────────────────────
-async def process_upload_task(doc_id: str, filename: str, user_id: str, content: bytes):
+async def process_upload_task(doc_id: str, filename: str, user_id: str, session_id: str, content: bytes):
     try:
         # Load with LangChain
         if filename.lower().endswith(".pdf"):
@@ -259,7 +316,7 @@ async def process_upload_task(doc_id: str, filename: str, user_id: str, content:
 
         await asyncio.to_thread(ensure_collection)
         points = []
-        batch_size = 25
+        batch_size = 96
 
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i+batch_size]
@@ -267,7 +324,7 @@ async def process_upload_task(doc_id: str, filename: str, user_id: str, content:
             
             import time
             start_t = time.time()
-            vectors = await embed_batch(texts, "retrieval_document")
+            vectors = await embed_batch(texts, "search_document")
             duration = time.time() - start_t
             print(f"[upload] Embedded batch of {len(texts)} chunks in {duration:.2f}s")
 
@@ -277,25 +334,54 @@ async def process_upload_task(doc_id: str, filename: str, user_id: str, content:
                     vector=vector,
                     payload={
                         "user_id":     user_id,
+                        "session_id":  session_id,
                         "source":      filename,
                         "chunk_index": i + j,
                         "text":        texts[j],
                     },
                 ))
 
-        await asyncio.to_thread(
-            qdrant.upsert, collection_name=COLLECTION_NAME, points=points
-        )
-        
+        import json
+        if points:
+            dim = len(points[0].vector)
+            payload_size = sum(len(json.dumps(p.payload)) for p in points)
+            print(f"[upload] Preparing to upsert {len(points)} points. First vector dimension: {dim}. Approx payload size: {payload_size} bytes.")
+            
+            upsert_batch_size = 5
+            total_batches = (len(points) + upsert_batch_size - 1) // upsert_batch_size
+            for idx in range(0, len(points), upsert_batch_size):
+                batch_pts = points[idx:idx+upsert_batch_size]
+                batch_num = (idx // upsert_batch_size) + 1
+                
+                # Retry loop for upserts
+                success = False
+                for attempt in range(3):
+                    try:
+                        print(f"[upload] Upserting batch {batch_num}/{total_batches} ({len(batch_pts)} points, attempt {attempt + 1})...")
+                        await asyncio.to_thread(
+                            qdrant.upsert, collection_name=COLLECTION_NAME, points=batch_pts
+                        )
+                        success = True
+                        print(f"[upload] Batch {batch_num}/{total_batches} SUCCESS.")
+                        break
+                    except Exception as e:
+                        print(f"[upload] Batch {batch_num}/{total_batches} FAILED on attempt {attempt + 1}: {type(e).__name__}: {e}")
+                        if attempt < 2:
+                            import time
+                            time.sleep(2)
+                
+                if not success:
+                    print(f"[upload] Batch {batch_num}/{total_batches} completely FAILED after 3 attempts.")
         await uploads_col.update_one({"doc_id": doc_id}, {"$set": {"status": "ready"}})
     except Exception as e:
-        print(f"[upload] Task failed for {doc_id}: {e}")
-        await uploads_col.update_one({"doc_id": doc_id}, {"$set": {"status": "failed", "error": str(e)}})
+        import logging
+        logging.exception(f"[upload] Task failed for {doc_id}")
+        await uploads_col.update_one({"doc_id": doc_id}, {"$set": {"status": "failed", "error": f"{type(e).__name__}: {str(e)}"}})
 
 
 @app.post("/upload")
 @limiter.limit("20/minute")
-async def upload(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...), user_id: str = Depends(get_current_user_or_session)):
+async def upload(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...), session_id: str = Form(""), user_id: str = Depends(get_current_user_or_session)):
     filename = file.filename or "document"
     
     if file.content_type not in ["application/pdf", "text/plain"]:
@@ -314,7 +400,7 @@ async def upload(request: Request, background_tasks: BackgroundTasks, file: Uplo
         "timestamp": datetime.now(timezone.utc)
     })
 
-    background_tasks.add_task(process_upload_task, doc_id, filename, user_id, content)
+    background_tasks.add_task(process_upload_task, doc_id, filename, user_id, session_id, content)
 
     return {
         "status": "processing",
@@ -328,135 +414,156 @@ async def upload_status(doc_id: str, user_id: str = Depends(get_current_user_or_
     doc = await uploads_col.find_one({"doc_id": doc_id, "user_id": user_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Upload not found")
-    return {"status": doc["status"]}
+    response = {"status": doc["status"]}
+    if "error" in doc:
+        response["error"] = doc["error"]
+    return response
 
 
 # ── POST /chat ────────────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
 async def chat(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_or_session)):
-    if not req.message.strip():
-        raise HTTPException(400, "message cannot be empty")
-
-    session_id = req.session_id or ""
-
-    # Persist user turn FIRST so load_history includes it (for prior_history slice)
-    await save_message(user_id, "user", req.message, session_id)
-
-    # 1. Embed the query and search Qdrant (scoped to this session)
-    query_vector = await embed(req.message, "retrieval_query")
-
-    results = await asyncio.to_thread(
-        qdrant.search,
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        query_filter=Filter(must=[
-            FieldCondition(key="user_id", match=MatchValue(value=user_id))
-        ]),
-        limit=TOP_K,
-        with_payload=True,
-    )
-
-    relevant = [r for r in results if r.score >= SIMILARITY_THRESHOLD]
-    grounded = len(relevant) > 0
-
-    if results:
-        score_summary = ", ".join(f"{r.score:.3f}" for r in results)
-        print(f"[chat] Top scores for user {user_id}: [{score_summary}] | grounded={grounded} threshold={SIMILARITY_THRESHOLD}")
-
-    # 2. Load prior conversation history (scoped to this session)
-    history      = await load_history(user_id, session_id)
-    prior_history = history[:-1]   # exclude the turn we just saved
-
-    # Model initialization is deferred to the execution block below based on req.model
-
-    # 3. Build the prompt
-    # Always behave as a helpful assistant. When relevant document chunks exist,
-    # inject them as optional background context — but do NOT restrict the model
-    # to ONLY those chunks. This keeps normal conversation working naturally.
-    SYSTEM_PERSONA = (
-        "You are Ragasiyam Core, a smart and friendly AI assistant. "
-        "You help users with general questions AND with understanding documents they upload. "
-        "Respond in a natural, conversational way.\n"
-        "IMPORTANT RULES:\n"
-        "- Refuse harmful or unsafe requests.\n"
-        "- Do not fabricate facts when answering from document context. If nothing relevant was retrieved, say so.\n"
-        "- Stay on-topic for a document-assistant use case.\n"
-        "- Use structured output formatting: use headers (##), bullet points, numbered steps, and fenced code blocks with language tags where relevant. Avoid writing a wall of plain text."
-    )
-
-    if grounded:
-        context_text = "\n\n---\n\n".join(
-            f"[Source: {r.payload['source']}, chunk {r.payload['chunk_index'] + 1}]\n"
-            f"{r.payload['text']}"
-            for r in relevant
-        )
-        prompt = (
-            f"{SYSTEM_PERSONA}\n\n"
-            "The user has uploaded documents. Relevant excerpts are provided below as context. "
-            "Use them to answer document-related questions. "
-            "For general conversation or questions not related to the documents, respond naturally "
-            "without mentioning the excerpts.\n\n"
-            f"=== Relevant Document Excerpts ===\n{context_text}\n"
-            f"=== End of Excerpts ===\n\n"
-            f"User: {req.message}"
-        )
-    else:
-        # No relevant docs found — pure conversational assistant mode.
-        prompt = (
-            f"{SYSTEM_PERSONA}\n\n"
-            f"User: {req.message}"
-        )
-
     try:
+        if not req.message.strip():
+            raise HTTPException(400, "message cannot be empty")
+
+        session_id = req.session_id or ""
+        print(f"[chat] Processing request: user_id={user_id}, session_id={session_id}")
+
+        await save_message(user_id, "user", req.message, session_id)
+
+        is_summarize = any(word in req.message.lower() for word in ["summarize", "summary", "describe", "what is this document about"])
+        
+        if is_summarize:
+            print("[chat] Summarization intent detected. Bypassing similarity search.")
+            scroll_res = await asyncio.to_thread(
+                qdrant.scroll,
+                collection_name=COLLECTION_NAME,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="session_id", match=MatchValue(value=session_id))
+                ]),
+                limit=20,
+                with_payload=True,
+            )
+            results = scroll_res[0]
+        else:
+            query_vector = await embed(req.message, "search_query")
+            results = await asyncio.to_thread(
+                qdrant.search,
+                collection_name=COLLECTION_NAME,
+                query_vector=query_vector,
+                query_filter=Filter(must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="session_id", match=MatchValue(value=session_id))
+                ]),
+                limit=TOP_K,
+                with_payload=True,
+            )
+
+        relevant = [r for r in results if getattr(r, 'score', 1.0) >= SIMILARITY_THRESHOLD]
+        grounded = len(relevant) > 0
+
+        if results:
+            score_summary = ", ".join(f"{getattr(r, 'score', 1.0):.3f}" for r in results)
+            print(f"[chat] Top scores for user {user_id} session {session_id}: [{score_summary}] | grounded={grounded}")
+            print("[chat] Retrieved chunks:")
+            for r in relevant:
+                print(f"  - Source: {r.payload.get('source')} | Session: {r.payload.get('session_id')}")
+
+        history      = await load_history(user_id, session_id)
+        prior_history = history[:-1]
+
+        SYSTEM_PERSONA = (
+            "You are Ragasiyam Core, a smart and friendly AI assistant. "
+            "You help users with general questions AND with understanding documents they upload. "
+            "Respond in a natural, conversational way.\n"
+            "IMPORTANT RULES:\n"
+            "- Refuse harmful or unsafe requests.\n"
+            "- Do not fabricate facts when answering from document context. If nothing relevant was retrieved, say so.\n"
+            "- Stay on-topic for a document-assistant use case.\n"
+            "- Use structured output formatting: use headers (##), bullet points, numbered steps, and fenced code blocks with language tags where relevant. Avoid writing a wall of plain text."
+        )
+
+        if grounded:
+            context_text = "\n\n---\n\n".join(
+                f"[Source: {r.payload['source']}, chunk {r.payload['chunk_index'] + 1}]\n"
+                f"{r.payload['text']}"
+                for r in relevant
+            )
+            prompt = (
+                f"{SYSTEM_PERSONA}\n\n"
+                "The user has uploaded documents. Relevant excerpts are provided below as context. "
+                "Use them to answer document-related questions. "
+                "For general conversation or questions not related to the documents, respond naturally "
+                "without mentioning the excerpts.\n\n"
+                f"=== Relevant Document Excerpts ===\n{context_text}\n"
+                f"=== End of Excerpts ===\n\n"
+                f"User: {req.message}"
+            )
+        else:
+            prompt = f"{SYSTEM_PERSONA}\n\nUser: {req.message}"
+
         is_groq_model = req.model in ["llama-3.3-70b-versatile", "deepseek-r1-distill-llama-70b"]
         
-        if is_groq_model and GROQ_API_KEY:
-            groq_messages = []
-            for m in prior_history:
-                groq_role = "assistant" if m["role"] == "model" else "user"
-                groq_messages.append({"role": groq_role, "content": m["parts"][0]})
-            groq_messages.append({"role": "user", "content": prompt})
-            
-            client = groq.AsyncGroq(api_key=GROQ_API_KEY)
-            groq_res = await client.chat.completions.create(
-                model=req.model,
-                messages=groq_messages,
-            )
-            reply_text = groq_res.choices[0].message.content
-            provider = "groq"
-        else:
-            gemini_model_name = req.model if req.model.startswith("gemini") else MODEL_NAME
-            model = genai.GenerativeModel(gemini_model_name)
-            chat_session = model.start_chat(history=prior_history)
-            response = chat_session.send_message(prompt)
-            reply_text = response.text
-            provider = "gemini"
-    except Exception as exc:
-        is_429 = isinstance(exc, ResourceExhausted) or "429" in str(exc) or "ResourceExhausted" in str(exc)
-        if is_429 and GROQ_API_KEY:
-            print("[INFO] Gemini rate limit hit (429), falling back to Groq...")
-            groq_messages = []
-            for m in prior_history:
-                groq_role = "assistant" if m["role"] == "model" else "user"
-                groq_messages.append({"role": groq_role, "content": m["parts"][0]})
-            groq_messages.append({"role": "user", "content": prompt})
-            
-            client = groq.AsyncGroq(api_key=GROQ_API_KEY)
-            groq_res = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=groq_messages,
-            )
-            reply_text = groq_res.choices[0].message.content
-            provider = "groq_fallback"
-        else:
-            raise HTTPException(502, f"Model error: {exc}") from exc
+        try:
+            if is_groq_model and GROQ_API_KEY:
+                groq_messages = []
+                for m in prior_history:
+                    groq_role = "assistant" if m["role"] == "model" else "user"
+                    groq_messages.append({"role": groq_role, "content": m["parts"][0]})
+                groq_messages.append({"role": "user", "content": prompt})
+                
+                client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+                groq_res = await asyncio.wait_for(
+                    client.chat.completions.create(model=req.model, messages=groq_messages),
+                    timeout=30.0
+                )
+                reply_text = groq_res.choices[0].message.content
+                provider = "groq"
+            else:
+                gemini_model_name = req.model if req.model.startswith("gemini") else MODEL_NAME
+                model = genai.GenerativeModel(gemini_model_name)
+                chat_session = model.start_chat(history=prior_history)
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(chat_session.send_message, prompt),
+                    timeout=30.0
+                )
+                reply_text = response.text
+                provider = "gemini"
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "LLM request timed out")
+        except Exception as exc:
+            is_429 = isinstance(exc, ResourceExhausted) or "429" in str(exc) or "ResourceExhausted" in str(exc)
+            if is_429 and GROQ_API_KEY:
+                print("[INFO] Gemini rate limit hit (429), falling back to Groq...")
+                groq_messages = []
+                for m in prior_history:
+                    groq_role = "assistant" if m["role"] == "model" else "user"
+                    groq_messages.append({"role": groq_role, "content": m["parts"][0]})
+                groq_messages.append({"role": "user", "content": prompt})
+                
+                client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+                groq_res = await asyncio.wait_for(
+                    client.chat.completions.create(model="llama-3.3-70b-versatile", messages=groq_messages),
+                    timeout=30.0
+                )
+                reply_text = groq_res.choices[0].message.content
+                provider = "groq_fallback"
+            else:
+                raise HTTPException(502, f"Model error: {exc}") from exc
 
-    print(f"[INFO] Chat request successfully served by: {provider}")
+        print(f"[INFO] Chat request successfully served by: {provider}")
+        await save_message(user_id, "assistant", reply_text, session_id)
+        return ChatResponse(reply=reply_text, grounded=grounded)
 
-    await save_message(user_id, "assistant", reply_text, session_id)
-
-    return ChatResponse(reply=reply_text, grounded=grounded)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.exception("[chat] Unhandled exception in chat endpoint")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 # ── POST /chat/vision ─────────────────────────────────────────────────
@@ -624,91 +731,127 @@ async def health():
 @limiter.limit("20/minute")
 async def chat_stream(request: Request, req: ChatRequest, user_id: str = Depends(get_current_user_or_session)):
     """Same RAG logic as /chat, but streams the reply via SSE chunks."""
-    if not req.message.strip():
-        raise HTTPException(400, "message cannot be empty")
+    try:
+        if not req.message.strip():
+            raise HTTPException(400, "message cannot be empty")
 
-    await save_message(user_id, "user", req.message)
+        session_id = req.session_id or ""
+        await save_message(user_id, "user", req.message, session_id)
 
-    # RAG retrieval (same as /chat)
-    query_vector = await embed(req.message, "retrieval_query")
-    results = await asyncio.to_thread(
-        qdrant.search,
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        query_filter=Filter(must=[
-            FieldCondition(key="user_id", match=MatchValue(value=user_id))
-        ]),
-        limit=TOP_K,
-        with_payload=True,
-    )
-    relevant = [r for r in results if r.score >= SIMILARITY_THRESHOLD]
-    grounded = len(relevant) > 0
+        is_summarize = any(word in req.message.lower() for word in ["summarize", "summary", "describe", "what is this document about"])
+        
+        if is_summarize:
+            print("[chat_stream] Summarization intent detected. Bypassing similarity search.")
+            scroll_res = await asyncio.to_thread(
+                qdrant.scroll,
+                collection_name=COLLECTION_NAME,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="session_id", match=MatchValue(value=session_id))
+                ]),
+                limit=20,
+                with_payload=True,
+            )
+            results = scroll_res[0]
+        else:
+            query_vector = await embed(req.message, "search_query")
+            results = await asyncio.to_thread(
+                qdrant.search,
+                collection_name=COLLECTION_NAME,
+                query_vector=query_vector,
+                query_filter=Filter(must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="session_id", match=MatchValue(value=session_id))
+                ]),
+                limit=TOP_K,
+                with_payload=True,
+            )
 
-    history      = await load_history(user_id)
-    prior_history = history[:-1]
+        relevant = [r for r in results if getattr(r, 'score', 1.0) >= SIMILARITY_THRESHOLD]
+        grounded = len(relevant) > 0
 
-    model_obj = genai.GenerativeModel(MODEL_NAME)
+        history      = await load_history(user_id, session_id)
+        prior_history = history[:-1]
 
-    if grounded:
-        context_text = "\n\n---\n\n".join(
-            f"[Source: {r.payload['source']}, chunk {r.payload['chunk_index'] + 1}]\n"
-            f"{r.payload['text']}"
-            for r in relevant
+        model_obj = genai.GenerativeModel(MODEL_NAME)
+
+        if grounded:
+            context_text = "\n\n---\n\n".join(
+                f"[Source: {r.payload.get('source', 'Unknown')}, chunk {r.payload.get('chunk_index', 0) + 1}]\n"
+                f"{r.payload.get('text', '')}"
+                for r in relevant
+            )
+            prompt = (
+                "You are a helpful assistant. Answer the user's question using ONLY "
+                "the document excerpts provided below.\n"
+                "If the answer is not contained in the excerpts, respond with exactly: "
+                "\"I don't have that information in the uploaded documents.\"\n"
+                "Do NOT use any knowledge outside of the excerpts below.\n\n"
+                f"=== Document Excerpts ===\n{context_text}\n"
+                f"=== End of Excerpts ===\n\n"
+                f"User question: {req.message}"
+            )
+        else:
+            prompt = req.message
+
+        # Bridge sync Gemini streaming -> async SSE via thread + Queue
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def gemini_thread():
+            try:
+                chat_session = model_obj.start_chat(history=prior_history)
+                response = chat_session.send_message(prompt, stream=True)
+                # Apply a manual timeout approach for the generator if needed, but streaming 
+                # usually waits on the first chunk. To be safe, we just let it run 
+                # and rely on the underlying library timeouts.
+                for chunk in response:
+                    if chunk.text:
+                        asyncio.run_coroutine_threadsafe(q.put(("chunk", chunk.text)), loop)
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(q.put(("error", str(exc))), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(("done", None)), loop)
+
+        threading.Thread(target=gemini_thread, daemon=True).start()
+
+        async def event_generator():
+            full_reply = ""
+            try:
+                while True:
+                    # Apply a timeout on the queue get to avoid hanging indefinitely if thread dies
+                    kind, data = await asyncio.wait_for(q.get(), timeout=30.0)
+                    if kind == "chunk":
+                        full_reply += data
+                        payload = json.dumps({"text": data, "done": False})
+                        yield f"data: {payload}\n\n"
+                    elif kind == "error":
+                        yield f"data: {json.dumps({'error': data, 'done': True})}\n\n"
+                        break
+                    elif kind == "done":
+                        # Persist the complete reply now that streaming finished
+                        await save_message(user_id, "assistant", full_reply, session_id)
+                        final = json.dumps({"text": "", "done": True, "grounded": grounded})
+                        yield f"data: {final}\n\n"
+                        break
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'error': 'LLM stream timed out', 'done': True})}\n\n"
+            except Exception as e:
+                import logging
+                logging.exception("[chat_stream] Error in event generator")
+                yield f"data: {json.dumps({'error': 'Internal Server Error', 'done': True})}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",   # disable nginx buffering if behind proxy
+            },
         )
-        prompt = (
-            "You are a helpful assistant. Answer the user's question using ONLY "
-            "the document excerpts provided below.\n"
-            "If the answer is not contained in the excerpts, respond with exactly: "
-            "\"I don't have that information in the uploaded documents.\"\n"
-            "Do NOT use any knowledge outside of the excerpts below.\n\n"
-            f"=== Document Excerpts ===\n{context_text}\n"
-            f"=== End of Excerpts ===\n\n"
-            f"User question: {req.message}"
-        )
-    else:
-        prompt = req.message
-
-    # Bridge sync Gemini streaming -> async SSE via thread + Queue
-    loop = asyncio.get_event_loop()
-    q: asyncio.Queue = asyncio.Queue()
-
-    def gemini_thread():
-        try:
-            chat_session = model_obj.start_chat(history=prior_history)
-            response = chat_session.send_message(prompt, stream=True)
-            for chunk in response:
-                if chunk.text:
-                    asyncio.run_coroutine_threadsafe(q.put(("chunk", chunk.text)), loop)
-        except Exception as exc:
-            asyncio.run_coroutine_threadsafe(q.put(("error", str(exc))), loop)
-        finally:
-            asyncio.run_coroutine_threadsafe(q.put(("done", None)), loop)
-
-    threading.Thread(target=gemini_thread, daemon=True).start()
-
-    async def event_generator():
-        full_reply = ""
-        while True:
-            kind, data = await q.get()
-            if kind == "chunk":
-                full_reply += data
-                payload = json.dumps({"text": data, "done": False})
-                yield f"data: {payload}\n\n"
-            elif kind == "error":
-                yield f"data: {json.dumps({'error': data, 'done': True})}\n\n"
-                break
-            elif kind == "done":
-                # Persist the complete reply now that streaming finished
-                await save_message(user_id, "assistant", full_reply)
-                final = json.dumps({"text": "", "done": True, "grounded": grounded})
-                yield f"data: {final}\n\n"
-                break
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable nginx buffering if behind proxy
-        },
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.exception("[chat_stream] Unhandled exception in stream endpoint")
+        raise HTTPException(status_code=500, detail="Internal Server Error")

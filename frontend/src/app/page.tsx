@@ -560,7 +560,7 @@ export default function ChatPage() {
     }
     setIsUploading(true);
     setPendingFile(file);
-    const fd = new FormData(); fd.append("file", file);
+    const fd = new FormData(); fd.append("file", file); fd.append("session_id", currentSessionId);
     try {
       const r = await fetch(`${API_BASE}/upload`, { method: "POST", headers: getHeaders(), body: fd });
       if (r.ok) {
@@ -570,9 +570,9 @@ export default function ChatPage() {
           try {
             const s = await fetch(`${API_BASE}/upload/status/${doc_id}`, { headers: getHeaders() });
             if (s.ok) {
-              const { status: st } = await s.json();
-              if (st === "ready") { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadInfo(null); setMessages((p) => [...p, { role: "assistant", content: `Document ingested: **${file.name}**` }]); }
-              else if (st === "failed") { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadError("Document ingestion failed."); }
+              const data = await s.json();
+              if (data.status === "ready") { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadInfo(null); setMessages((p) => [...p, { role: "assistant", content: `Document ingested: **${file.name}**` }]); }
+              else if (data.status === "failed") { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadError(data.error || "Document ingestion failed."); }
             }
           } catch { clearInterval(poll); setIsUploading(false); setPendingFile(null); setUploadError("Polling failed."); }
         }, 2000);
