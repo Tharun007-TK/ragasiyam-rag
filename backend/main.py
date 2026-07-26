@@ -290,16 +290,24 @@ async def save_message(user_id: str, role: str, content: str, session_id: str = 
         "timestamp":  datetime.now(timezone.utc),
     })
 
-async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assistant_msg: str):
+async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assistant_msg: str, image_filename: str = None):
     """Background task to generate a title for a new session."""
     try:
         if not GROQ_API_KEY:
             raise ValueError("No GROQ_API_KEY")
         
+        is_image_msg = image_filename or user_msg.strip().lower().startswith("[image]")
+        
+        if is_image_msg:
+            # Don't pass the raw placeholder, base title purely on assistant's semantic response
+            prompt_user_context = "User uploaded an image."
+        else:
+            prompt_user_context = f"User: {user_msg}"
+
         prompt = (
             "Summarize this conversation in 4-6 words as a title, no punctuation at the end, no quotes. "
-            "Do not use bracketed tags like [Image]. If the user message is just an image or empty, summarize based on the assistant's reply:\n"
-            f"User: {user_msg}\nAssistant: {assistant_msg}"
+            "Do not use bracketed tags like [Image].\n"
+            f"{prompt_user_context}\nAssistant: {assistant_msg}"
         )
         
         client = groq.AsyncGroq(api_key=GROQ_API_KEY)
@@ -313,12 +321,15 @@ async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assi
         )
         title = res.choices[0].message.content.strip(' ".\'\n')
         # Sometimes it still returns [Image], fallback to assistant message
-        if title.lower() == "[image]" or not title:
+        if not title or title.strip().lower().startswith("[image"):
             raise ValueError("Bad title generated")
     except Exception as e:
         print(f"[title] Groq title generation failed or returned bad title: {e}")
-        fallback_msg = user_msg if (user_msg and user_msg.lower() not in ["", "[image]", "[file]"]) else assistant_msg
-        title = (fallback_msg[:40] + "...") if len(fallback_msg) > 40 else fallback_msg
+        is_image_msg = image_filename or (user_msg and user_msg.strip().lower().startswith("[image]"))
+        if is_image_msg:
+            title = f"Image: {image_filename}" if image_filename else "Image Upload"
+        else:
+            title = (user_msg[:40] + "...") if len(user_msg) > 40 else user_msg
 
     try:
         await chats_col.update_many(
@@ -617,6 +628,7 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 @limiter.limit("10/minute")
 async def chat_vision(
     request: Request,
+    background_tasks: BackgroundTasks,
     message: str = Form(""),
     session_id: str = Form(""),
     image: UploadFile = File(...),
@@ -684,6 +696,10 @@ async def chat_vision(
 
     print(f"[INFO] Vision request served by: {provider}")
     await save_message(user_id, "assistant", reply_text, session_id)
+    
+    if len(prior_history) == 0:
+        background_tasks.add_task(generate_chat_title, session_id, user_id, f"[Image] {user_text}", reply_text, image.filename)
+
     return {"reply": reply_text, "grounded": False}
 
 
