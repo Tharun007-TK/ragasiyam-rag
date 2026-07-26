@@ -600,7 +600,12 @@ export default function ChatPage() {
   };
 
   if (status === "loading") {
-    return <div style={{ display:'flex', height:'100vh', alignItems:'center', justifyContent:'center', background: t.mainBg }}><span style={{ color: t.textFaint, fontSize: 14 }}>Loading…</span></div>;
+    return (
+      <div style={{ display:'flex', height:'100vh', width:'100%', alignItems:'center', justifyContent:'center', background: t.mainBg, flexDirection: 'column', gap: 12 }}>
+        <div className="w-8 h-8 rounded-full border-4 border-[#6366f1] border-t-transparent animate-spin"></div>
+        <span style={{ color: t.textFaint, fontSize: 14, fontWeight: 500 }}>Loading...</span>
+      </div>
+    );
   }
 
   const isGuestLimitReached = status === "unauthenticated" && guestMessageCount >= GUEST_LIMIT;
