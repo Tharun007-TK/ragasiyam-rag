@@ -6,40 +6,40 @@ RAG'asiyam is an intelligent, full-stack conversational assistant powered by Ret
 
 ```mermaid
 flowchart LR
-    classDef user     fill:#1a1a2e,stroke:#4f8ef7,color:#fff,rx:20
+    classDef user     fill:#1a1a2e,stroke:#4f8ef7,color:#fff
     classDef frontend fill:#162032,stroke:#38bdf8,color:#fff
     classDef backend  fill:#162032,stroke:#38bdf8,color:#fff
     classDef rag      fill:#0f2027,stroke:#34d399,color:#fff
     classDef llm      fill:#0f2027,stroke:#a78bfa,color:#fff
-    classDef db       fill:#0f2027,stroke:#fb923c,color:#fff,rx:6
+    classDef db       fill:#0f2027,stroke:#fb923c,color:#fff
 
-    User(["User"]):::user
+    User([User]):::user
 
-    subgraph FE["Frontend"]
-        UI["Next.js 14\nChat Interface"]:::frontend
+    subgraph FE[Frontend]
+        UI[Next.js 14\nChat Interface]:::frontend
     end
 
-    subgraph BE["Backend"]
-        API["FastAPI\nServer"]:::backend
+    subgraph BE[Backend]
+        API[FastAPI\nServer]:::backend
     end
 
-    subgraph RAG["RAG Pipeline"]
+    subgraph RAG[RAG Pipeline]
         direction TB
-        Splitter["LangChain\nSplitter"]:::rag
-        Embedder["Cohere\nEmbeddings"]:::rag
+        Splitter[LangChain\nSplitter]:::rag
+        Embedder[Cohere\nEmbeddings]:::rag
         Splitter --> Embedder
     end
 
-    subgraph LLM["LLM Providers"]
+    subgraph LLM[LLM Providers]
         direction TB
-        Gemini["Gemini\n2.5 Flash"]:::llm
-        Groq["Groq\nLlama 3.1"]:::llm
+        Gemini[Gemini\n2.5 Flash]:::llm
+        Groq[Groq\nLlama 3.1]:::llm
     end
 
-    subgraph DATA["Data Layer"]
+    subgraph DATA[Data Layer]
         direction TB
-        Qdrant[("Qdrant\nVector DB")]:::db
-        Mongo[("MongoDB\nAtlas")]:::db
+        Qdrant[(Qdrant\nVector DB)]:::db
+        Mongo[(MongoDB\nAtlas)]:::db
     end
 
     User -->|ask / upload| UI
@@ -51,7 +51,8 @@ flowchart LR
     API -->|prompt| Gemini
     Gemini -->|stream| UI
     API -->|title gen| Groq
-    API <-->|history| Mongo
+    API -->|save| Mongo
+    Mongo -->|load history| API
 ```
 
 ## Features
