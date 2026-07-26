@@ -11,10 +11,10 @@ langchain==0.2.6
 langchain-community==0.2.6
 qdrant-client==1.9.1
 pypdf==4.2.0
-# protobuf must stay <5 — google-generativeai 0.7.x upper bound
+# grpcio-tools 1.62.1 requires protobuf<5 — compatible with google-generativeai 0.7.2
+# grpcio-tools 1.63+ requires protobuf>=5.26.1 which conflicts with google-generativeai
+grpcio==1.62.1
+grpcio-tools==1.62.1
 protobuf>=3.19.5,<5.0.0dev
-# Pin grpcio to versions with prebuilt wheels for Python 3.11 on Linux
-grpcio==1.66.2
-grpcio-tools==1.66.2
 groq
 cohere
