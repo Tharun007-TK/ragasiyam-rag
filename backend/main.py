@@ -67,6 +67,7 @@ mongo_client = AsyncIOMotorClient(MONGODB_URI)
 db           = mongo_client["ragasiyam"]
 chats_col    = db["chats"]
 uploads_col  = db["uploads"]
+memory_col   = db["user_memory"]
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
 COLLECTION_NAME      = "ragasiyam_documents_cohere"
@@ -109,17 +110,22 @@ async def get_current_user_or_session(
     request: Request,
     token: str = Depends(oauth2_scheme)
 ):
+    print(f"[debug auth] token: {token}")
+    print(f"[debug auth] request headers: {request.headers}")
     if token:
         try:
             payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
             user_id = payload.get("sub")
             if user_id:
+                print(f"[debug auth] success with token for user: {user_id}")
                 return user_id
-        except jwt.PyJWTError:
+        except jwt.PyJWTError as e:
+            print(f"[debug auth] jwt error: {e}")
             pass # fallback to session_id if token is invalid or expired
             
     # Fallback to session_id (used for guests)
     session_id = request.headers.get("X-Session-ID")
+    print(f"[debug auth] session_id header: {session_id}")
     if not session_id:
         raise HTTPException(status_code=401, detail="Unauthenticated: No valid JWT or X-Session-ID provided")
     
@@ -221,6 +227,12 @@ class SessionOut(BaseModel):
     title: str
     created_at: str
     message_count: int
+
+class MemoryOut(BaseModel):
+    id: str
+    fact: str
+    source_session_id: str
+    created_at: str
 
 
 # ── Embedding helper (sync, run in thread pool) ───────────────────────────────
@@ -339,6 +351,63 @@ async def generate_chat_title(session_id: str, user_id: str, user_msg: str, assi
         print(f"[title] Generated title for {session_id}: {title}")
     except Exception as e:
         print(f"[title] Failed to save title for {session_id}: {e}")
+
+async def extract_memory_task(user_id: str, session_id: str, messages: list[dict]):
+    """Background task to extract durable facts from the conversation history."""
+    try:
+        if not GROQ_API_KEY:
+            return
+        
+        # Format history for the prompt
+        formatted_history = "\n".join([f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['parts'][0]}" for m in messages])
+        
+        prompt = (
+            "Extract any durable facts about the user worth remembering for future conversations - "
+            "preferences, ongoing projects, decisions made, personal details. "
+            "Return EXACTLY a JSON array of strings containing short factual statements. "
+            "If nothing durable was discussed, return an empty array [].\n"
+            "Example: [\"User loves writing code in Rust\", \"User is currently working on an AI project\"]\n"
+            "Do NOT include conversational filler, backticks, or any text other than the JSON array.\n\n"
+            f"=== Conversation ===\n{formatted_history}"
+        )
+        
+        client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+        res = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.1
+            ),
+            timeout=15.0
+        )
+        content = res.choices[0].message.content.strip()
+        
+        # Parse JSON
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        facts = json.loads(content)
+        if not isinstance(facts, list):
+            raise ValueError("LLM did not return a JSON array")
+            
+        if facts:
+            print(f"[memory] Extracted {len(facts)} facts for user {user_id}")
+            now = datetime.now(timezone.utc)
+            # Insert each fact
+            for fact in facts:
+                if isinstance(fact, str) and fact.strip():
+                    await memory_col.insert_one({
+                        "user_id": user_id,
+                        "fact": fact.strip(),
+                        "source_session_id": session_id,
+                        "created_at": now
+                    })
+    except Exception as e:
+        print(f"[memory] Memory extraction failed: {e}")
 
 
 # ── POST /upload ──────────────────────────────────────────────────────────────
@@ -526,6 +595,14 @@ async def chat(request: Request, req: ChatRequest, background_tasks: BackgroundT
         history      = await load_history(user_id, session_id)
         prior_history = history[:-1]
 
+        # Fetch user memory if it's the start of a new session
+        memory_block = ""
+        if len(prior_history) == 0:
+            memories = await memory_col.find({"user_id": user_id}).to_list(100)
+            if memories:
+                facts = [m["fact"] for m in memories]
+                memory_block = "\n\n=== What you know about this user ===\n" + "\n".join(f"- {fact}" for fact in facts) + "\n====================================="
+
         SYSTEM_PERSONA = (
             "You are Ragasiyam Core, a smart and friendly AI assistant. "
             "You help users with general questions AND with understanding documents they upload. "
@@ -535,6 +612,7 @@ async def chat(request: Request, req: ChatRequest, background_tasks: BackgroundT
             "- Do not fabricate facts when answering from document context. If nothing relevant was retrieved, say so.\n"
             "- Stay on-topic for a document-assistant use case.\n"
             "- Use structured output formatting: use headers (##), bullet points, numbered steps, and fenced code blocks with language tags where relevant. Avoid writing a wall of plain text."
+            f"{memory_block}"
         )
 
         if grounded:
@@ -610,6 +688,10 @@ async def chat(request: Request, req: ChatRequest, background_tasks: BackgroundT
         
         if len(prior_history) == 0:
             background_tasks.add_task(generate_chat_title, session_id, user_id, req.message, reply_text)
+        elif len(prior_history) > 0 and len(prior_history) % 4 == 0:
+            # Trigger memory extraction periodically (e.g. after 5 messages total = 4 prior)
+            full_history = history + [{"role": "model", "parts": [reply_text]}]
+            background_tasks.add_task(extract_memory_task, user_id, session_id, full_history[-6:])
 
         return ChatResponse(reply=reply_text, grounded=grounded)
 
@@ -663,10 +745,8 @@ async def chat_vision(
         "Respond in a natural, conversational way."
     )
     image_part = {
-        "inline_data": {
-            "mime_type": image.content_type,
-            "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
-        }
+        "mime_type": image.content_type,
+        "data": image_bytes,
     }
     text_part = f"{system_persona}\n\nUser: {user_text}"
 
@@ -836,6 +916,13 @@ async def chat_stream(request: Request, req: ChatRequest, background_tasks: Back
         history      = await load_history(user_id, session_id)
         prior_history = history[:-1]
 
+        memory_block = ""
+        if len(prior_history) == 0:
+            memories = await memory_col.find({"user_id": user_id}).to_list(100)
+            if memories:
+                facts = [m["fact"] for m in memories]
+                memory_block = "\n\n=== What you know about this user ===\n" + "\n".join(f"- {fact}" for fact in facts) + "\n=====================================\n\n"
+
         model_obj = genai.GenerativeModel(MODEL_NAME)
 
         if grounded:
@@ -845,6 +932,7 @@ async def chat_stream(request: Request, req: ChatRequest, background_tasks: Back
                 for r in relevant
             )
             prompt = (
+                f"{memory_block}"
                 "You are a helpful assistant. Answer the user's question using ONLY "
                 "the document excerpts provided below.\n"
                 "If the answer is not contained in the excerpts, respond with exactly: "
@@ -855,7 +943,7 @@ async def chat_stream(request: Request, req: ChatRequest, background_tasks: Back
                 f"User question: {req.message}"
             )
         else:
-            prompt = req.message
+            prompt = memory_block + req.message
 
         # Bridge sync Gemini streaming -> async SSE via thread + Queue
         loop = asyncio.get_event_loop()
@@ -897,6 +985,9 @@ async def chat_stream(request: Request, req: ChatRequest, background_tasks: Back
                         
                         if len(prior_history) == 0:
                             background_tasks.add_task(generate_chat_title, session_id, user_id, req.message, full_reply)
+                        elif len(prior_history) > 0 and len(prior_history) % 4 == 0:
+                            full_history = history + [{"role": "model", "parts": [full_reply]}]
+                            background_tasks.add_task(extract_memory_task, user_id, session_id, full_history[-6:])
 
                         final = json.dumps({"text": "", "done": True, "grounded": grounded})
                         yield f"data: {final}\n\n"
@@ -990,3 +1081,36 @@ async def delete_session(session_id: str, user_id: str = Depends(get_current_use
         import logging
         logging.exception(f"[delete] Error deleting session {session_id}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# ── GET /memory ───────────────────────────────────────────────────────────────
+@app.get("/memory", response_model=list[MemoryOut])
+async def get_memory(user_id: str = Depends(get_current_user_or_session)):
+    """Return all stored memories for the user."""
+    cursor = memory_col.find({"user_id": user_id}).sort("created_at", -1)
+    memories = []
+    async for doc in cursor:
+        memories.append(MemoryOut(
+            id=str(doc["_id"]),
+            fact=doc["fact"],
+            source_session_id=doc.get("source_session_id", ""),
+            created_at=doc["created_at"].isoformat(),
+        ))
+    return memories
+
+
+# ── DELETE /memory/{fact_id} ──────────────────────────────────────────────────
+@app.delete("/memory/{fact_id}")
+async def delete_memory(fact_id: str, user_id: str = Depends(get_current_user_or_session)):
+    """Delete a specific memory fact."""
+    from bson.objectid import ObjectId
+    try:
+        obj_id = ObjectId(fact_id)
+        res = await memory_col.delete_one({"_id": obj_id, "user_id": user_id})
+        if res.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        return {"status": "ok"}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail="Invalid memory ID")

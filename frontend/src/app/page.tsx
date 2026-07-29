@@ -168,18 +168,58 @@ function generateSessionId() {
 
 // ─── Settings Modal ────────────────────────────────────────────────────────────
 function SettingsModal({
-  isDark, setIsDark, fontSize, setFontSize, onClose, t,
+  isDark, setIsDark, fontSize, setFontSize, onClose, t, getHeaders
 }: {
   isDark: boolean; setIsDark: (v: boolean) => void;
   fontSize: string; setFontSize: (v: string) => void;
-  onClose: () => void; t: typeof LIGHT;
+  onClose: () => void; t: typeof LIGHT; getHeaders: () => Record<string, string>;
 }) {
-  const [activeTab, setActiveTab] = useState<"appearance" | "account" | "about">("appearance");
+  const [activeTab, setActiveTab] = useState<"appearance" | "account" | "memory" | "about">("appearance");
   const { data: session, status } = useSession();
+  const [memories, setMemories] = useState<any[]>([]);
+  const [loadingMemories, setLoadingMemories] = useState(false);
+
+  useEffect(() => {
+    if (activeTab === "memory") {
+      fetchMemories();
+    }
+  }, [activeTab]);
+
+  const fetchMemories = async () => {
+    setLoadingMemories(true);
+    try {
+      const res = await fetch(`/api/py/memory`, {
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMemories(data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch memories", e);
+    } finally {
+      setLoadingMemories(false);
+    }
+  };
+
+  const deleteMemory = async (id: string) => {
+    try {
+      const res = await fetch(`/api/py/memory/${id}`, {
+        method: "DELETE",
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        setMemories((prev) => prev.filter((m) => m.id !== id));
+      }
+    } catch (e) {
+      console.error("Failed to delete memory", e);
+    }
+  };
 
   const tabs = [
     { id: "appearance" as const, label: "Appearance", icon: <Sun className="w-4 h-4" /> },
     { id: "account"    as const, label: "Account",    icon: <Shield className="w-4 h-4" /> },
+    { id: "memory"     as const, label: "Memory",     icon: <Zap className="w-4 h-4" /> },
     { id: "about"      as const, label: "About",      icon: <Info className="w-4 h-4" /> },
   ];
 
@@ -312,6 +352,49 @@ function SettingsModal({
                       <Link href="/login" className="px-4 py-2 rounded-xl font-medium" style={{ background: t.sessionActive, color: t.text, fontSize: 13 }}>Log in</Link>
                       <Link href="/signup" className="px-4 py-2 rounded-xl font-medium text-white" style={{ background: '#6366f1', fontSize: 13 }}>Sign up</Link>
                     </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeTab === "memory" && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-3 p-4 rounded-xl mb-4" style={{ background: t.menuHover, border: `1px solid ${t.divider}` }}>
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shrink-0">
+                    <Zap className="w-5 h-5 text-white" />
+                  </div>
+                  <div>
+                    <p style={{ fontSize: 14, fontWeight: 600, color: t.text }}>Cross-Session Memory</p>
+                    <p style={{ fontSize: 12, color: t.textMuted }}>Facts the AI has learned about you across sessions.</p>
+                  </div>
+                </div>
+
+                {loadingMemories ? (
+                  <p style={{ fontSize: 13, color: t.textMuted, textAlign: "center", padding: "20px 0" }}>Loading memories...</p>
+                ) : memories.length === 0 ? (
+                  <p style={{ fontSize: 13, color: t.textMuted, textAlign: "center", padding: "20px 0" }}>No memories stored yet. The AI will learn facts about you as you chat.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {memories.map((m) => (
+                      <div key={m.id} className="flex items-center justify-between p-3 rounded-xl transition-colors group" style={{ background: t.menuBg, border: `1px solid ${t.divider}` }}>
+                        <div className="flex-1 pr-4">
+                          <p style={{ fontSize: 13.5, color: t.text, lineHeight: 1.5 }}>{m.fact}</p>
+                          <p style={{ fontSize: 11, color: t.textMuted, marginTop: 4 }}>
+                            {new Date(m.created_at).toLocaleDateString()}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => deleteMemory(m.id)}
+                          className="p-2 rounded-lg transition-colors shrink-0"
+                          style={{ color: '#ef4444' }}
+                          onMouseEnter={(e) => { (e.target as HTMLElement).style.background = 'rgba(239, 68, 68, 0.1)'; }}
+                          onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent'; }}
+                          title="Delete memory"
+                        >
+                          <Trash2 className="w-4 h-4 pointer-events-none" />
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -779,7 +862,7 @@ export default function ChatPage() {
 
       {/* Settings modal */}
       {settingsOpen && (
-        <SettingsModal isDark={isDark} setIsDark={setIsDark} fontSize={fontSize} setFontSize={setFontSize} onClose={() => setSettingsOpen(false)} t={t} />
+        <SettingsModal isDark={isDark} setIsDark={setIsDark} fontSize={fontSize} setFontSize={setFontSize} onClose={() => setSettingsOpen(false)} t={t} getHeaders={getHeaders} />
       )}
 
       {/* Help modal */}
